@@ -12,6 +12,7 @@ from discord.ext import commands
 from offkai_bot import config
 from offkai_bot.alerts.alerts import alert_loop
 from offkai_bot.alerts.reminders import register_checkin_reminder, register_deadline_reminders
+from offkai_bot.config import get_config
 
 # Import only necessary data loaders for initial cache population
 from offkai_bot.data.event import load_event_data
@@ -82,6 +83,9 @@ class OffkaiClient(commands.Bot):
         load_responses()  # Loads both attendees and waitlist
         load_rankings()
         _log.info("Initial data loaded into cache.")
+
+        if not get_config().get("FRONTEND_URL"):
+            _log.warning("FRONTEND_URL is not set — check-in URLs will be omitted from DMs.")
 
         # Sync commands
         for guild_id in settings["GUILDS"]:
