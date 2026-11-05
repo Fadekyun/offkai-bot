@@ -84,7 +84,7 @@ This bot replaces manual methods of collecting attendance such as:
   - Blank or whitespace-only input falls back to the user's current Discord display name, then username
   - Names are trimmed and snapshotted per event; later Discord nickname changes do not rewrite existing responses
   - Discord `user_id` remains authoritative, while usernames remain available to organizers for auditing and disambiguation
-  - Duplicate preferred names are allowed, and changing a submitted name requires withdrawing and responding again
+  - Duplicate preferred names are allowed; organizers can correct confirmed attendee and guest names in the admin panel without changing the registration
 
 - **💬 Communication Tools**
   - Broadcast messages to all event attendees
@@ -192,6 +192,21 @@ For local development, set `ADMIN_API_PORT=8091` for the bot (host defaults to `
 and `BOT_ADMIN_URL=http://127.0.0.1:8091` for the frontend. Both use the same `ADMIN_KEY`.
 Without `ADMIN_API_PORT`, the bot API remains disabled. Keep this connection private;
 the browser calls the existing frontend admin API, which forwards the action to the bot.
+
+### Admin attendee name corrections
+
+Confirmed attendees have an edit control for their event display name and their existing guest names.
+Only the current guest slots are editable; the editor never adds, removes, reorders or compacts guests, and an
+untouched legacy unnamed slot is preserved. Waitlisted registrations are out of scope.
+
+The browser captures the original names when the editor opens and sends them with the edit. The bot resolves the
+event's Discord thread to enforce the configured guild boundary, then revalidates the selected event, user ID,
+registration timestamp, original names and guest slots immediately before its existing atomic JSON write. A removed,
+rejoined or promoted/demoted registration, a changed guest count, changed surplus legacy names, or another admin's
+name edit is rejected with a refresh/retry conflict instead of overwriting current data. Unrelated payment or
+check-in updates are preserved. Saving names never sends Discord messages, changes roles, or triggers signup,
+payment, attendance or promotion actions; previously sent messages are not updated. A lost response is treated as
+unconfirmed and the admin panel refreshes rather than retrying the write blindly.
 
 ### Payment proof by DM
 

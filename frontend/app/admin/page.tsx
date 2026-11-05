@@ -68,10 +68,11 @@ export default function AdminPage() {
         <div className="space-y-2">
           {data.filtered.map(a => (
             <AttendeeRow
-              key={`${data.eventName}:${a.user_id}`}
+              key={`${data.eventName}:${a.user_id}:${a.registration_timestamp ?? 'none'}`}
               attendee={a}
               adminKey={data.key} eventName={data.eventName} onPayment={data.updatePayment}
               onRemove={data.removeRegistration}
+              onSaveNames={data.saveAttendeeNames}
               checkin={data.checkins[a.user_id]}
               onCheckin={data.manualCheckin}
               onCheckout={data.manualCheckout}

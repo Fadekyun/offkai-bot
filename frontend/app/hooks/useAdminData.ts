@@ -5,12 +5,19 @@ import { matchesCheckin } from '../lib/checkin'
 
 const groupSize = (a: Attendee) => 1 + (a.extra_people ?? 0)
 
+export type NamesSaveOutcome = 'saved' | 'conflict' | 'invalid' | 'unconfirmed' | 'error' | 'stale'
+export type NamesExpected = { display_name: string | null; extra_people: number; extras_names: (string | null)[] }
+export type NamesChanges = { display_name?: string; extras_names?: { index: number; value: string }[] }
+
 // Owns admin auth + the selected event's attendees/check-ins, the manual
 // check-in/out actions, and the filtered/derived view data. The scanner hook is
 // kept separate and feeds successful scans back via `applyScanCheckin`.
 export function useAdminData() {
   const selectedEventRef = useRef('')
   const eventGeneration = useRef(0)
+  // Invalidates an in-flight attendee fetch when a name save crosses it, so
+  // pre-save polling data cannot replace the names that were just persisted.
+  const attendeeLoadId = useRef(0)
   const attendeesRef = useRef<Attendee[]>([])
   const [key, setKey] = useState('')
   const [authed, setAuthed] = useState(false)
@@ -44,11 +51,13 @@ export function useAdminData() {
   const loadAttendees = useCallback(async (adminKey: string, ev: string) => {
     const generation = eventGeneration.current
     if (selectedEventRef.current !== ev) return false
+    const loadId = ++attendeeLoadId.current
     const evParam = ev ? `&event=${encodeURIComponent(ev)}` : ''
     const res = await fetch(`/api/attendees?key=${encodeURIComponent(adminKey)}${evParam}`)
     if (!res.ok) return false
     const { event_name, attendees: att } = await res.json()
-    if (generation !== eventGeneration.current || selectedEventRef.current !== ev) return false
+    if (loadId !== attendeeLoadId.current || generation !== eventGeneration.current ||
+        selectedEventRef.current !== ev) return false
     setEventName(event_name)
     attendeesRef.current = att
     setAttendees(att)
@@ -183,6 +192,96 @@ export function useAdminData() {
     return true
   }, [key, selectedEvent, eventName, loadAttendees])
 
+  // Persist only the edited name fields using the raw snapshot captured when the
+  // editor opened. The bot rechecks that snapshot immediately before its atomic
+  // write; polling never updates this snapshot. A lost response refreshes to
+  // confirm, and the mutation is never retried automatically.
+  const saveAttendeeNames = useCallback(async (
+    requestedEvent: string,
+    userId: string,
+    timestamp: string,
+    expected: NamesExpected,
+    changes: NamesChanges,
+  ): Promise<NamesSaveOutcome> => {
+    if (!eventName || eventName !== selectedEvent || selectedEventRef.current !== eventName ||
+        requestedEvent !== eventName) return 'stale'
+    if (!attendeesRef.current.some(a => a.status === 'attending' && a.user_id === userId &&
+        a.registration_timestamp === timestamp)) return 'stale'
+    const generation = eventGeneration.current
+    const stillCurrent = () => generation === eventGeneration.current && selectedEventRef.current === eventName
+    let response: Response | undefined
+    let result: {
+      saved?: boolean
+      error?: string
+      registration?: { user_id?: string; registration_timestamp?: string; display_name?: string | null
+        extra_people?: number; extras_names?: string[] }
+    } = {}
+    try {
+      response = await fetch('/api/registration/names?key=' + encodeURIComponent(key), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ event_name: eventName, user_id: userId, registration_timestamp: timestamp,
+          expected, changes }),
+      })
+      result = await response.json().catch(() => ({}))
+    } catch {
+      // A timeout can follow a committed save. Refresh to confirm; never retry it automatically.
+    }
+    if (!stillCurrent()) return 'stale'
+
+    // A refresh failure or timeout must never turn a confirmed save into a reported failure.
+    const refresh = async () => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          loadAttendees(key, eventName),
+          new Promise<void>(resolve => { timer = setTimeout(resolve, 10_000) }),
+        ])
+      } catch { /* keep the confirmed result */ } finally {
+        if (timer) clearTimeout(timer)
+      }
+    }
+    const registration = result.registration
+    const returnedDisplayName = registration?.display_name
+    const returnedExtrasNames = registration?.extras_names
+    const validRegistration = !!registration &&
+      registration.user_id === userId &&
+      typeof registration.registration_timestamp === 'string' &&
+      Date.parse(registration.registration_timestamp) === Date.parse(timestamp) &&
+      registration.extra_people === expected.extra_people &&
+      (returnedDisplayName === null || typeof returnedDisplayName === 'string') &&
+      Array.isArray(returnedExtrasNames) &&
+      returnedExtrasNames.every(name => typeof name === 'string')
+    if (response?.ok && result.saved === true && validRegistration &&
+        (returnedDisplayName === null || typeof returnedDisplayName === 'string') &&
+        Array.isArray(returnedExtrasNames)) {
+      // Invalidate any poll that began before this confirmed write, then show the
+      // persisted names immediately even if the follow-up refresh fails.
+      attendeeLoadId.current += 1
+      const names: Pick<Attendee, 'display_name' | 'extras_names'> = {
+        display_name: returnedDisplayName,
+        extras_names: [...returnedExtrasNames],
+      }
+      const applyNames = (list: Attendee[]) => list.map(a =>
+        a.status === 'attending' && a.user_id === userId && a.registration_timestamp === timestamp
+          ? { ...a, ...names }
+          : a)
+      setAttendees(applyNames)
+      attendeesRef.current = applyNames(attendeesRef.current)
+      await refresh()
+      return stillCurrent() ? 'saved' : 'stale'
+    }
+    if (response?.status === 400) return 'invalid'
+    if (response?.status === 401) return 'error'
+    if (response?.status === 500 && result.error === 'write_failed') return 'error'
+    if (response?.status === 409 || response?.status === 404) {
+      await refresh()
+      return stillCurrent() ? 'conflict' : 'stale'
+    }
+    // Unknown or ambiguous transport outcome: refresh without claiming a result.
+    await refresh()
+    return stillCurrent() ? 'unconfirmed' : 'stale'
+  }, [key, selectedEvent, eventName, loadAttendees])
+
   const removeRegistration = useCallback(async (userId: string, timestamp: string) => {
     if (!eventName || eventName !== selectedEvent || selectedEventRef.current !== eventName) return false
     const generation = eventGeneration.current
@@ -268,7 +367,7 @@ export function useAdminData() {
     key, authed, keyInput, setKeyInput, loginError, handleLogin,
     eventName, events, selectedEvent, changeEvent,
     updatePayment, attendees, checkins: currentCheckins, applyScanCheckin, manualCheckin, manualCheckout,
-    removeRegistration, promoteRegistration, actionWarnings,
+    saveAttendeeNames, removeRegistration, promoteRegistration, actionWarnings,
     filter, changeFilter, search, setSearch,
     filtered, waitlist, pendingCount, checkedInCount, attendingCount,
     waitlistCount: waitlist.length,

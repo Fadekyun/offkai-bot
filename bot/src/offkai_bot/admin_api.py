@@ -12,9 +12,18 @@ from aiohttp import web
 
 from offkai_bot.config import get_config
 from offkai_bot.data.event import get_event
-from offkai_bot.data.response import get_responses, get_waitlist, promote_waitlist_response
+from offkai_bot.data.response import (
+    MAX_DISPLAY_NAME_LENGTH,
+    MAX_EXTRA_PEOPLE,
+    MAX_GUEST_NAME_LENGTH,
+    get_responses,
+    get_waitlist,
+    promote_waitlist_response,
+    update_attendee_names,
+)
 from offkai_bot.errors import (
     EventNotFoundError,
+    MissingChannelIDError,
     RegistrationChangedError,
     ResponseNotFoundError,
     ThreadAccessError,
@@ -53,6 +62,77 @@ async def parse_admin_request(request: web.Request, client: discord.Client) -> t
     if not isinstance(event_name, str) or not event_name or len(event_name) > 100:
         return web.json_response({"error": "invalid_request"}, status=400)
     return event_name, user_id
+
+
+def _parse_registration_timestamp(value: object) -> datetime:
+    if not isinstance(value, str) or len(value) > 100:
+        raise ValueError("Invalid timestamp")
+    timestamp = datetime.fromisoformat(value)
+    if timestamp.tzinfo is None:
+        raise ValueError("Timestamp requires timezone")
+    timestamp = timestamp.astimezone(UTC)
+    # The frontend displays and submits millisecond-precision ISO timestamps.
+    return timestamp.replace(microsecond=timestamp.microsecond // 1000 * 1000)
+
+
+def _parse_names_payload(
+    body: dict,
+) -> tuple[datetime, str | None, int, list[str | None], str | None, list[tuple[int, str]]]:
+    if set(body) != {"event_name", "user_id", "registration_timestamp", "expected", "changes"}:
+        raise ValueError("Unexpected request fields")
+    expected_timestamp = _parse_registration_timestamp(body.get("registration_timestamp"))
+    expected = body.get("expected")
+    if not isinstance(expected, dict) or set(expected) != {"display_name", "extra_people", "extras_names"}:
+        raise ValueError("Invalid expected snapshot")
+    expected_display_name = expected["display_name"]
+    expected_extra_people = expected["extra_people"]
+    expected_extras_names = expected["extras_names"]
+    if expected_display_name is not None and not isinstance(expected_display_name, str):
+        raise ValueError("Invalid expected attendee name")
+    if type(expected_extra_people) is not int or not (0 <= expected_extra_people <= MAX_EXTRA_PEOPLE):
+        raise ValueError("Invalid expected guest count")
+    if not isinstance(expected_extras_names, list) or len(expected_extras_names) < expected_extra_people:
+        raise ValueError("Invalid expected guest names")
+    for index, slot in enumerate(expected_extras_names):
+        if index < expected_extra_people:
+            if slot is not None and not isinstance(slot, str):
+                raise ValueError("Invalid expected guest names")
+        elif not isinstance(slot, str):
+            raise ValueError("Invalid expected surplus guest names")
+
+    changes = body.get("changes")
+    if not isinstance(changes, dict) or not changes or not set(changes) <= {"display_name", "extras_names"}:
+        raise ValueError("Invalid name changes")
+    display_name = changes.get("display_name")
+    if "display_name" in changes and (
+        not isinstance(display_name, str) or len(display_name.strip()) > MAX_DISPLAY_NAME_LENGTH
+    ):
+        raise ValueError("Invalid attendee name")
+    guest_changes = changes.get("extras_names", [])
+    if not isinstance(guest_changes, list):
+        raise ValueError("Invalid guest name changes")
+    guest_names: list[tuple[int, str]] = []
+    indices: set[int] = set()
+    for change in guest_changes:
+        if not isinstance(change, dict) or set(change) != {"index", "value"}:
+            raise ValueError("Invalid guest name change")
+        index, value = change["index"], change["value"]
+        if type(index) is not int or not (0 <= index < expected_extra_people) or index in indices:
+            raise ValueError("Invalid guest index")
+        if not isinstance(value, str) or len(value.strip()) > MAX_GUEST_NAME_LENGTH:
+            raise ValueError("Invalid guest name")
+        indices.add(index)
+        guest_names.append((index, value))
+    if display_name is None and not guest_names:
+        raise ValueError("No name changes supplied")
+    return (
+        expected_timestamp,
+        expected_display_name,
+        expected_extra_people,
+        expected_extras_names,
+        display_name,
+        guest_names,
+    )
 
 
 def create_admin_app(client: discord.Client) -> web.Application:
@@ -238,9 +318,82 @@ def create_admin_app(client: discord.Client) -> web.Application:
                 warnings.append(warning)
         return web.json_response({"promoted": True, "warnings": warnings})
 
+    async def rename(request: web.Request) -> web.Response:
+        parsed = await parse_admin_request(request, client)
+        if isinstance(parsed, web.Response):
+            return parsed
+        event_name, user_id = parsed
+        body = await request.json()
+        try:
+            (
+                expected_timestamp,
+                expected_display_name,
+                expected_extra_people,
+                expected_extras_names,
+                display_name,
+                guest_names,
+            ) = _parse_names_payload(body)
+        except (ValueError, TypeError):
+            return web.json_response({"error": "invalid_request", "saved": False}, status=400)
+        settings = get_config()
+        try:
+            event = get_event(event_name)
+            if event.archived or event.interest_check:
+                return web.json_response({"error": "event_unavailable", "saved": False}, status=400)
+            # Resolve the real guild/thread before changing registration data.
+            thread = await fetch_thread_for_event(client, event)
+            if thread.guild.id not in settings["GUILDS"]:
+                return web.json_response({"error": "event_unavailable", "saved": False}, status=403)
+        except (EventNotFoundError, MissingChannelIDError, ThreadNotFoundError, discord.NotFound):
+            return web.json_response({"error": "preflight_not_found", "saved": False}, status=404)
+        except (ThreadAccessError, discord.Forbidden):
+            return web.json_response({"error": "preflight_forbidden", "saved": False}, status=403)
+        except Exception:
+            _log.exception("Admin name update preflight failed")
+            return web.json_response({"error": "preflight_unavailable", "saved": False}, status=503)
+        # Recheck availability after the network preflight. The final identity and
+        # snapshot validation and atomic commit below remain synchronous.
+        try:
+            event = get_event(event_name)
+        except EventNotFoundError:
+            return web.json_response({"error": "not_found", "saved": False}, status=404)
+        if event.archived or event.interest_check or event.thread_id != thread.id:
+            return web.json_response({"error": "event_unavailable", "saved": False}, status=400)
+        try:
+            updated = update_attendee_names(
+                event.event_name,
+                int(user_id),
+                expected_timestamp,
+                expected_display_name,
+                expected_extra_people,
+                expected_extras_names,
+                display_name=display_name,
+                guest_names=guest_names,
+            )
+        except RegistrationChangedError:
+            return web.json_response({"error": "registration_changed", "saved": False}, status=409)
+        except ValueError:
+            return web.json_response({"error": "invalid_request", "saved": False}, status=400)
+        except Exception:
+            _log.exception("Admin name update failed for event %r", event_name)
+            return web.json_response({"error": "write_failed", "saved": False}, status=500)
+        return web.json_response(
+            {
+                "saved": True,
+                "registration": {
+                    "user_id": str(updated.user_id),
+                    "registration_timestamp": expected_timestamp.isoformat(),
+                    "display_name": updated.display_name,
+                    "extra_people": updated.extra_people,
+                    "extras_names": list(updated.extras_names),
+                },
+            }
+        )
+
     app = web.Application(client_max_size=4096)
     app.router.add_post("/registrations/remove", remove)
     app.router.add_post("/registrations/promote", promote)
+    app.router.add_post("/registrations/names", rename)
     app.router.add_post("/payments/confirm", confirm_payment)
     return app
 
