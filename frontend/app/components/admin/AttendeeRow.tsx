@@ -4,7 +4,7 @@ import { PaymentControl } from './PaymentControl'
 import { RemoveRegistration } from './RemoveRegistration'
 import { drinkDot } from '../../lib/format'
 import type { Attendee, CheckinRecord } from '../../lib/types'
-import type { NamesChanges, NamesExpected, NamesSaveOutcome } from '../../hooks/useAdminData'
+import type { NamesChanges, NamesSaveOutcome } from '../../hooks/useAdminData'
 
 export function AttendeeRow({
   attendee: a,
@@ -17,7 +17,7 @@ export function AttendeeRow({
   eventName: string
   onPayment: (userId: string, paid: boolean, timestamp: string) => Promise<boolean>
   onRemove: (userId: string, timestamp: string) => Promise<boolean>
-  onSaveNames: (eventName: string, userId: string, timestamp: string, expected: NamesExpected,
+  onSaveNames: (eventName: string, userId: string, timestamp: string, expectedRevision: string,
     changes: NamesChanges) => Promise<NamesSaveOutcome>
   attendee: Attendee
   checkin?: CheckinRecord

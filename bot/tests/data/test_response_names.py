@@ -16,6 +16,7 @@ from offkai_bot.data.response import (
     WaitlistEntry,
     build_attendee_report_rows,
     calculate_attendance,
+    compute_names_revision,
     update_attendee_names,
 )
 from offkai_bot.errors import RegistrationChangedError
@@ -59,13 +60,7 @@ def edit(**overrides):
     current = response_data.get_responses("Names")[0]
     arguments = {
         "expected_timestamp": NOW,
-        "expected_display_name": current.display_name,
-        "expected_extra_people": current.extra_people,
-        "expected_extras_names": [
-            current.extras_names[index] if index < len(current.extras_names) else None
-            for index in range(current.extra_people)
-        ]
-        + list(current.extras_names[current.extra_people :]),
+        "expected_revision": compute_names_revision(current.display_name, current.extra_people, current.extras_names),
     }
     arguments.update(overrides)
     return update_attendee_names("Names", UID, **arguments).registration
@@ -185,9 +180,7 @@ def test_legacy_missing_display_name_guest_only_edit_matches_loaded_null(tmp_pat
         "Names",
         UID,
         NOW,
-        None,
-        1,
-        ["Alice"],
+        compute_names_revision(None, 1, ["Alice"]),
         guest_names=[(0, "  Alicia  ")],
     )
     updated = update.registration
@@ -217,9 +210,7 @@ def test_sparse_legacy_slots_are_preserved_or_materialised_only_when_needed(tmp_
         "Names",
         UID,
         NOW,
-        "Before",
-        2,
-        ["Alice", "Bob"],
+        compute_names_revision("Before", 2, ["Alice", "Bob"]),
         guest_names=[(1, "  Bea  ")],
     ).registration
     assert slot_one.extras_names == ["Alice", "Bea"]
@@ -234,7 +225,13 @@ def test_sparse_legacy_slots_are_preserved_or_materialised_only_when_needed(tmp_
         ({"guest_names": [(0, "x" * 161)]}, "at most 160"),
         ({"guest_names": [(3, "Out of range")]}, "out of range"),
         ({"guest_names": [(0, "One"), (0, "Again")]}, "more than once"),
-        ({"display_name": "X", "expected_extra_people": 1, "expected_extras_names": ["Alice"]}, "changed"),
+        (
+            {
+                "display_name": "X",
+                "expected_revision": compute_names_revision("Before", 2, ["Alice"]),
+            },
+            "changed",
+        ),
     ],
 )
 def test_invalid_or_stale_edits_leave_cache_and_disk_unchanged(tmp_path, monkeypatch, overrides, message):
@@ -249,12 +246,29 @@ def test_invalid_or_stale_edits_leave_cache_and_disk_unchanged(tmp_path, monkeyp
     assert path.read_bytes() == before_disk
 
 
+@pytest.mark.parametrize("guest_count", [6, -1, True])
+def test_unsupported_current_guest_count_is_rejected_before_mutation(tmp_path, monkeypatch, guest_count):
+    original = attendee(extra_people=guest_count, extras_names=["Alice", "Bob"])
+    path = write_cache(tmp_path, monkeypatch, [original])
+    before_cache = response_data.RESPONSE_DATA_CACHE
+    before_disk = path.read_bytes()
+    with pytest.raises(ValueError, match="Guest count must be between 0 and 5"):
+        edit(display_name="After")
+    assert response_data.RESPONSE_DATA_CACHE is before_cache
+    assert response_data.RESPONSE_DATA_CACHE["Names"]["attendees"][0] is original
+    assert original.display_name == "Before"
+    assert path.read_bytes() == before_disk
+
+
 def test_surplus_legacy_names_are_part_of_the_conflict_snapshot_and_are_preserved(tmp_path, monkeypatch):
     original = attendee(extra_people=1, extras_names=["Alice", "Legacy surplus"], extras_attendee_numbers=[5])
     write_cache(tmp_path, monkeypatch, [original])
 
     with pytest.raises(RegistrationChangedError):
-        edit(display_name="Stale", expected_extras_names=["Alice", "Changed surplus"])
+        edit(
+            display_name="Stale",
+            expected_revision=compute_names_revision("Before", 1, ["Alice", "Changed surplus"]),
+        )
     assert response_data.get_responses("Names")[0].display_name == "Before"
 
     updated = edit(display_name="After", guest_names=[(0, "Alicia")])
@@ -270,10 +284,7 @@ def test_stale_snapshot_is_rejected(tmp_path, monkeypatch, mutation):
     waitlist = []
     records = [original]
     write_cache(tmp_path, monkeypatch, records, waitlist)
-    expected_display = original.display_name
-    expected_extra = original.extra_people
-    expected_names = ["Alice", "Bob"]
-
+    expected_revision = compute_names_revision(original.display_name, original.extra_people, original.extras_names)
     expected_timestamp = NOW - timedelta(minutes=1) if mutation == "rejoin" else NOW
     if mutation == "display_name":
         original.display_name = "Changed elsewhere"
@@ -296,9 +307,7 @@ def test_stale_snapshot_is_rejected(tmp_path, monkeypatch, mutation):
             "Names",
             UID,
             expected_timestamp,
-            expected_display,
-            expected_extra,
-            expected_names,
+            expected_revision,
             display_name="Stale",
         )
     assert response_data.RESPONSE_DATA_CACHE["Names"]["attendees"] == ([] if mutation == "demoted" else [original])
@@ -307,14 +316,15 @@ def test_stale_snapshot_is_rejected(tmp_path, monkeypatch, mutation):
 def test_two_admin_edits_conflict_and_second_does_not_overwrite_first(tmp_path, monkeypatch):
     original = attendee()
     write_cache(tmp_path, monkeypatch, [original])
-    stale_snapshot = {
-        "expected_display_name": "Before",
-        "expected_extra_people": 2,
-        "expected_extras_names": ["Alice", "Bob"],
-    }
+    stale_snapshot = {"expected_revision": compute_names_revision("Before", 2, ["Alice", "Bob"])}
 
     first = update_attendee_names(
-        "Names", UID, NOW, "Before", 2, ["Alice", "Bob"], display_name="First", guest_names=[(0, "Alicia")]
+        "Names",
+        UID,
+        NOW,
+        compute_names_revision("Before", 2, ["Alice", "Bob"]),
+        display_name="First",
+        guest_names=[(0, "Alicia")],
     ).registration
     assert first.display_name == "First"
     with pytest.raises(RegistrationChangedError):
@@ -331,7 +341,13 @@ def test_unrelated_bot_updates_are_preserved_and_survive_later_bot_save(tmp_path
     original.behavior_confirmed = False
     response_data.save_responses()
 
-    updated = update_attendee_names("Names", UID, NOW, "Before", 2, ["Alice", "Bob"], display_name="After").registration
+    updated = update_attendee_names(
+        "Names",
+        UID,
+        NOW,
+        compute_names_revision("Before", 2, ["Alice", "Bob"]),
+        display_name="After",
+    ).registration
     assert updated.payment_method == "PayNow"
     assert updated.payment_selection_expires_at == NOW + timedelta(hours=2)
     assert updated.behavior_confirmed is False
@@ -360,7 +376,13 @@ def test_other_attendees_and_later_bot_actions_are_preserved(tmp_path, monkeypat
     )
     write_cache(tmp_path, monkeypatch, [original, other])
 
-    update_attendee_names("Names", UID, NOW, "Before", 2, ["Alice", "Bob"], display_name="After")
+    update_attendee_names(
+        "Names",
+        UID,
+        NOW,
+        compute_names_revision("Before", 2, ["Alice", "Bob"]),
+        display_name="After",
+    )
     records = response_data.get_responses("Names")
     assert len(records) == 2
     assert records[0].display_name == "After"
@@ -382,9 +404,7 @@ def test_change_metadata_reports_only_persisted_differences_and_noop_skips_write
             "Names",
             UID,
             NOW,
-            "Before",
-            2,
-            ["Alice", ""],
+            compute_names_revision("Before", 2, ["Alice", ""]),
             display_name="  Before  ",
             guest_names=[(0, "Alice")],
         )
@@ -397,9 +417,7 @@ def test_change_metadata_reports_only_persisted_differences_and_noop_skips_write
         "Names",
         UID,
         NOW,
-        "Before",
-        2,
-        ["Alice", ""],
+        compute_names_revision("Before", 2, ["Alice", ""]),
         display_name="  After  ",
         guest_names=[(1, "  New Guest  ")],
     )
@@ -420,7 +438,13 @@ def test_failed_atomic_write_leaves_cache_and_disk_unchanged(tmp_path, monkeypat
         patch("offkai_bot.data.response.atomic_write_json", side_effect=OSError("disk unavailable")),
         pytest.raises(OSError, match="disk unavailable"),
     ):
-        update_attendee_names("Names", UID, NOW, "Before", 2, ["Alice", "Bob"], display_name="After")
+        update_attendee_names(
+            "Names",
+            UID,
+            NOW,
+            compute_names_revision("Before", 2, ["Alice", "Bob"]),
+            display_name="After",
+        )
     assert response_data.RESPONSE_DATA_CACHE is cache
     assert response_data.get_responses("Names")[0] is original
     assert original.display_name == "Before"
@@ -434,6 +458,10 @@ def test_millisecond_identity_match_accepts_submillisecond_storage(tmp_path, mon
     write_cache(tmp_path, monkeypatch, [original])
     expected = NOW
     updated = update_attendee_names(
-        "Names", UID, expected, "Before", 2, ["Alice", "Bob"], display_name="After"
+        "Names",
+        UID,
+        expected,
+        compute_names_revision("Before", 2, ["Alice", "Bob"]),
+        display_name="After",
     ).registration
     assert updated.display_name == "After"

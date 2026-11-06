@@ -17,6 +17,7 @@ from offkai_bot.data.response import (
     WaitlistEntry,
     add_response,
     add_to_waitlist,
+    compute_names_revision,
     get_responses,
     get_waitlist,
     load_responses,
@@ -61,24 +62,103 @@ def make_attendee(**overrides) -> Response:
     return Response(**values)
 
 
-def payload(event: Event, current: Response, **overrides):
+def payload(event: Event, current: Response, *, revision: str | None = None, **overrides):
     body = {
         "event_name": event.event_name,
         "user_id": str(UID),
         "registration_timestamp": current.timestamp.isoformat(),
-        "expected": {
-            "display_name": current.display_name,
-            "extra_people": current.extra_people,
-            "extras_names": [
-                current.extras_names[index] if index < len(current.extras_names) else None
-                for index in range(current.extra_people)
-            ]
-            + list(current.extras_names[current.extra_people :]),
-        },
+        "expected_revision": revision
+        or compute_names_revision(current.display_name, current.extra_people, current.extras_names),
         "changes": {"display_name": "After"},
     }
     body.update(overrides)
     return body
+
+
+def name_parts(changes: object) -> list[tuple[str, str]]:
+    if not isinstance(changes, dict):
+        return []
+    parts: list[tuple[str, str]] = []
+    if isinstance(changes.get("display_name"), str):
+        parts.append(("display_name", changes["display_name"]))
+    guest_changes = changes.get("extras_names")
+    if isinstance(guest_changes, list):
+        for change in guest_changes:
+            if isinstance(change, dict) and type(change.get("index")) is int and isinstance(change.get("value"), str):
+                parts.append((f"guest:{change['index']}", change["value"]))
+    return parts
+
+
+def stage_body(event: Event, body: dict, field: str, value: str, *, manifest, batch_id: str | None = None):
+    staged = {
+        "operation": "stage",
+        "event_name": event.event_name,
+        "user_id": body["user_id"],
+        "registration_timestamp": body["registration_timestamp"],
+        "expected_revision": body["expected_revision"],
+        "manifest": manifest,
+        "field": field,
+        "value": value,
+    }
+    if batch_id is not None:
+        staged["batch_id"] = batch_id
+    return staged
+
+
+def commit_body(event: Event, body: dict, manifest, batch_id: str):
+    return {
+        "operation": "commit",
+        "event_name": event.event_name,
+        "user_id": body["user_id"],
+        "registration_timestamp": body["registration_timestamp"],
+        "expected_revision": body["expected_revision"],
+        "manifest": manifest,
+        "batch_id": batch_id,
+    }
+
+
+async def save_names(http, event: Event, body: dict, *, sizes: list[int] | None = None):
+    allowed = {"event_name", "user_id", "registration_timestamp", "expected_revision", "changes"}
+    if set(body) - allowed:
+        staged = stage_body(event, body, "display_name", "After", manifest=["display_name"])
+        staged.update({key: value for key, value in body.items() if key not in allowed})
+        raw = json.dumps(staged, separators=(",", ":")).encode("utf-8")
+        if sizes is not None:
+            sizes.append(len(raw))
+        reply = await http.post("/registrations/names", data=raw, headers=HEADERS)
+        return reply.status, await reply.json()
+    changes = body.get("changes")
+    parts = name_parts(changes)
+    manifest = [field for field, _value in parts]
+    if not parts or len(set(manifest)) != len(manifest) or set(changes or {}) - {"display_name", "extras_names"}:
+        # Send a harmless-shaped invalid stage so the server still owns rejection.
+        raw = json.dumps(stage_body(event, body, "unknown", "x", manifest=["unknown"]), separators=(",", ":")).encode(
+            "utf-8"
+        )
+        if sizes is not None:
+            sizes.append(len(raw))
+        reply = await http.post("/registrations/names", data=raw, headers=HEADERS)
+        return reply.status, await reply.json()
+    batch_id = None
+    for field, value in parts:
+        raw = json.dumps(
+            stage_body(event, body, field, value, manifest=manifest, batch_id=batch_id),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if sizes is not None:
+            sizes.append(len(raw))
+        reply = await http.post("/registrations/names", data=raw, headers=HEADERS)
+        result = await reply.json()
+        if reply.status != 200:
+            return reply.status, result
+        batch_id = result["batch_id"]
+    assert batch_id is not None
+    raw = json.dumps(commit_body(event, body, manifest, batch_id), separators=(",", ":")).encode("utf-8")
+    if sizes is not None:
+        sizes.append(len(raw))
+    reply = await http.post("/registrations/names", data=raw, headers=HEADERS)
+    return reply.status, await reply.json()
 
 
 @pytest.fixture
@@ -100,10 +180,9 @@ def names_setup(monkeypatch, mock_paths):
     return event, client, Path(mock_paths["responses"])
 
 
-async def post_names(client, event, body, *, headers=HEADERS):
+async def post_names(client, event, body):
     async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
-        reply = await http.post("/registrations/names", json=body, headers=headers)
-        return reply.status, await reply.json()
+        return await save_names(http, event, body)
 
 
 async def test_name_edit_persists_before_sending_one_changed_fields_dm(names_setup):
@@ -143,6 +222,7 @@ async def test_name_edit_persists_before_sending_one_changed_fields_dm(names_set
             "display_name": "After",
             "extra_people": 2,
             "extras_names": ["Alicia", "Bob"],
+            "names_revision": "1107b635afe1f73d87b88669ec352d86a9d7a87ee1c9487c317ee606a878b24f",
         },
     }
     assert len(sent) == 1
@@ -176,7 +256,7 @@ async def post_names_raw(client, raw: bytes):
 
 
 @pytest.mark.parametrize("guest_count", range(6))
-async def test_max_length_multibyte_names_are_accepted_for_every_guest_count(names_setup, guest_count):
+async def test_max_length_multibyte_names_use_bounded_parts_and_one_commit(names_setup, guest_count):
     event, client, path = names_setup
     old_display = "名😀" * 16
     new_display = "新😀" * 16
@@ -193,13 +273,15 @@ async def test_max_length_multibyte_names_are_accepted_for_every_guest_count(nam
     if guest_count:
         changes["extras_names"] = [{"index": index, "value": value} for index, value in enumerate(new_guests)]
     body = payload(event, current, changes=changes)
-    raw = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    sizes: list[int] = []
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        status, result = await save_names(http, event, body, sizes=sizes)
 
-    status, result = await post_names_raw(client, raw)
-
-    assert status == 200, (len(raw), result)
+    assert status == 200, result
     assert result["saved"] is True
     assert result["warnings"] == []
+    assert len(sizes) == guest_count + 2  # part per field plus one commit
+    assert all(size <= 4096 for size in sizes), sizes
     saved = get_responses(event.event_name)[0]
     assert saved.display_name == new_display
     assert saved.extras_names == new_guests
@@ -207,22 +289,30 @@ async def test_max_length_multibyte_names_are_accepted_for_every_guest_count(nam
     assert client.get_user.return_value.send.await_count == 1
 
 
-async def test_exact_16k_padded_json_is_accepted_and_one_byte_over_is_rejected(names_setup):
+async def test_exact_4k_stage_request_is_accepted_and_one_byte_over_is_rejected(names_setup):
     event, client, path = names_setup
     current = make_attendee()
     add_response(event.event_name, current)
+    body = payload(event, current, changes={"display_name": "After"})
     base = json.dumps(
-        payload(event, current, changes={"display_name": "After"}),
+        stage_body(event, body, "display_name", "After", manifest=["display_name"]),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    exact = base + b" " * (admin_api.NAME_EDIT_MAX_REQUEST_BYTES - len(base))
-    too_large = exact + b" "
-    assert len(exact) == 16384
-    assert len(too_large) == 16385
+    exact = base + b" " * (4096 - len(base))
+    assert len(exact) == 4096
 
-    status, result = await post_names_raw(client, exact)
-    assert status == 200, result
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post("/registrations/names", data=exact, headers=HEADERS)
+        staged = await reply.json()
+        assert reply.status == 200, staged
+        reply = await http.post(
+            "/registrations/names",
+            json=commit_body(event, body, ["display_name"], staged["batch_id"]),
+            headers=HEADERS,
+        )
+        result = await reply.json()
+    assert reply.status == 200, result
     assert result["saved"] is True
     assert get_responses(event.event_name)[0].display_name == "After"
     assert client.get_user.return_value.send.await_count == 1
@@ -234,12 +324,8 @@ async def test_exact_16k_padded_json_is_accepted_and_one_byte_over_is_rejected(n
     current = make_attendee()
     add_response(event.event_name, current)
     disk = path.read_bytes()
-    base = json.dumps(
-        payload(event, current, changes={"display_name": "After"}),
-        ensure_ascii=False,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    too_large = base + b" " * (admin_api.NAME_EDIT_MAX_REQUEST_BYTES + 1 - len(base))
+    too_large = exact + b" "
+    assert len(too_large) == 4097
     status, result = await post_names_raw(client, too_large)
     assert status == 413
     assert result == {"error": "request_too_large", "saved": False}
@@ -249,21 +335,22 @@ async def test_exact_16k_padded_json_is_accepted_and_one_byte_over_is_rejected(n
     assert client.get_user.call_count == 1
 
 
-async def test_streamed_body_over_16k_is_rejected_without_usable_content_length(names_setup):
+async def test_streamed_body_over_4k_is_rejected_without_usable_content_length(names_setup):
     event, client, path = names_setup
     current = make_attendee()
     add_response(event.event_name, current)
     disk = path.read_bytes()
+    body = payload(event, current, changes={"display_name": "After"})
     base = json.dumps(
-        payload(event, current, changes={"display_name": "After"}),
+        stage_body(event, body, "display_name", "After", manifest=["display_name"]),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
-    raw = base + b" " * (admin_api.NAME_EDIT_MAX_REQUEST_BYTES + 1 - len(base))
+    raw = base + b" " * (4097 - len(base))
 
     async def chunks():
-        for offset in range(0, len(raw), 1000):
-            yield raw[offset : offset + 1000]
+        for offset in range(0, len(raw), 500):
+            yield raw[offset : offset + 500]
 
     async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
         reply = await http.post("/registrations/names", data=chunks(), headers=HEADERS)
@@ -298,12 +385,10 @@ async def test_other_admin_routes_retain_the_4k_limit(names_setup):
         {"unexpected": True},
         {"registration_timestamp": "not-a-timestamp"},
         {"registration_timestamp": "2026-10-01T12:00:00"},
-        {"expected": {"display_name": "Before", "extra_people": 2, "extras_names": ["Alice"]}},
-        {"expected": {"display_name": "Before", "extra_people": 2, "extras_names": ["Alice", "Bob"], "extra": 1}},
         {"changes": {}},
         {"changes": {"display_name": "   "}},
         {"changes": {"display_name": "x" * 33}},
-        {"changes": {"extras_names": [{"index": 2, "value": "Out of range"}]}},
+        {"changes": {"extras_names": [{"index": 6, "value": "Out of range"}]}},
         {"changes": {"extras_names": [{"index": 0, "value": "One"}, {"index": 0, "value": "Again"}]}},
         {"changes": {"extras_names": [{"index": 0, "value": "   "}]}},
         {"changes": {"unknown": "value"}},
@@ -332,8 +417,12 @@ async def test_authentication_and_event_guards(names_setup, monkeypatch):
     add_response(event.event_name, current)
     body = payload(event, current)
 
-    assert (await post_names(client, event, body, headers={}))[0] == 401
-    assert (await post_names(client, event, body, headers={"Authorization": "Bearer wrong"}))[0] == 401
+    staged = stage_body(event, body, "display_name", "After", manifest=["display_name"])
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        assert (await http.post("/registrations/names", json=staged, headers={})).status == 401
+        assert (
+            await http.post("/registrations/names", json=staged, headers={"Authorization": "Bearer wrong"})
+        ).status == 401
 
     monkeypatch.setattr(admin_api, "get_event", lambda name: make_event(archived=True))
     assert (await post_names(client, event, body)) == (
@@ -622,3 +711,216 @@ async def test_disk_write_failure_returns_error_and_preserves_cache_and_disk(nam
     client.get_user.assert_not_called()
     client.fetch_user.assert_not_called()
     client.get_user.return_value.send.assert_not_awaited()
+
+
+async def test_staging_leaves_cache_disk_and_dm_untouched(names_setup):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    disk = path.read_bytes()
+    cache = get_responses(event.event_name)
+    body = payload(
+        event,
+        current,
+        changes={
+            "display_name": "After",
+            "extras_names": [{"index": 0, "value": "Alicia"}],
+        },
+    )
+    manifest = ["display_name", "guest:0"]
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "display_name", "After", manifest=manifest),
+            headers=HEADERS,
+        )
+        staged = await reply.json()
+    assert reply.status == 200
+    assert staged["complete"] is False
+    assert get_responses(event.event_name) is cache
+    assert get_responses(event.event_name)[0] is current
+    assert path.read_bytes() == disk
+    client.get_user.assert_not_called()
+    client.get_user.return_value.send.assert_not_awaited()
+
+
+async def test_incomplete_batch_never_partially_writes_and_can_still_complete(names_setup):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    disk = path.read_bytes()
+    body = payload(
+        event,
+        current,
+        changes={
+            "display_name": "After",
+            "extras_names": [{"index": 0, "value": "Alicia"}],
+        },
+    )
+    manifest = ["display_name", "guest:0"]
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "display_name", "After", manifest=manifest),
+            headers=HEADERS,
+        )
+        batch_id = (await reply.json())["batch_id"]
+        reply = await http.post(
+            "/registrations/names",
+            json=commit_body(event, body, manifest, batch_id),
+            headers=HEADERS,
+        )
+        result = await reply.json()
+        assert reply.status == 409
+        assert result == {"error": "batch_incomplete", "saved": False}
+        assert get_responses(event.event_name)[0].display_name == "Before"
+        assert path.read_bytes() == disk
+        assert client.get_user.return_value.send.await_count == 0
+
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "guest:0", "Alicia", manifest=manifest, batch_id=batch_id),
+            headers=HEADERS,
+        )
+        assert reply.status == 200
+        reply = await http.post(
+            "/registrations/names",
+            json=commit_body(event, body, manifest, batch_id),
+            headers=HEADERS,
+        )
+        result = await reply.json()
+    assert reply.status == 200, result
+    assert result["saved"] is True
+    assert get_responses(event.event_name)[0].extras_names == ["Alicia", "Bob"]
+    assert client.get_user.return_value.send.await_count == 1
+
+
+async def test_expired_batch_is_rejected_without_mutation_or_dm(names_setup, monkeypatch):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    disk = path.read_bytes()
+    body = payload(event, current)
+    clock = [1000.0]
+    monkeypatch.setattr(admin_api, "_name_batch_now", lambda: clock[0])
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "display_name", "After", manifest=["display_name"]),
+            headers=HEADERS,
+        )
+        batch_id = (await reply.json())["batch_id"]
+        clock[0] += admin_api.NAME_BATCH_TTL_SECONDS + 1
+        reply = await http.post(
+            "/registrations/names",
+            json=commit_body(event, body, ["display_name"], batch_id),
+            headers=HEADERS,
+        )
+        result = await reply.json()
+    assert reply.status == 409
+    assert result == {"error": "batch_expired", "saved": False}
+    assert path.read_bytes() == disk
+    assert get_responses(event.event_name)[0].display_name == "Before"
+    client.get_user.return_value.send.assert_not_awaited()
+
+
+async def test_active_batch_count_is_bounded(names_setup):
+    event, client, _ = names_setup
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        for index in range(admin_api.MAX_ACTIVE_NAME_BATCHES):
+            body = payload(event, make_attendee(), user_id=str(UID + index))
+            reply = await http.post(
+                "/registrations/names",
+                json=stage_body(event, body, "display_name", "After", manifest=["display_name"]),
+                headers=HEADERS,
+            )
+            assert reply.status == 200
+        body = payload(event, make_attendee(), user_id=str(UID + admin_api.MAX_ACTIVE_NAME_BATCHES))
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "display_name", "After", manifest=["display_name"]),
+            headers=HEADERS,
+        )
+        result = await reply.json()
+    assert reply.status == 409
+    assert result == {"error": "batch_busy", "saved": False}
+    client.get_user.return_value.send.assert_not_awaited()
+
+
+async def test_stage_context_mismatch_and_conflicting_replay_are_rejected(names_setup):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    body = payload(
+        event,
+        current,
+        changes={
+            "display_name": "After",
+            "extras_names": [{"index": 0, "value": "Alicia"}],
+        },
+    )
+    manifest = ["display_name", "guest:0"]
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "display_name", "After", manifest=manifest),
+            headers=HEADERS,
+        )
+        batch_id = (await reply.json())["batch_id"]
+
+        wrong_context = stage_body(event, body, "guest:0", "Alicia", manifest=manifest, batch_id=batch_id)
+        wrong_context["registration_timestamp"] = (NOW + timedelta(seconds=1)).isoformat()
+        reply = await http.post("/registrations/names", json=wrong_context, headers=HEADERS)
+        assert reply.status == 409
+        assert await reply.json() == {"error": "batch_context_mismatch", "saved": False}
+
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "display_name", "Different", manifest=manifest, batch_id=batch_id),
+            headers=HEADERS,
+        )
+        assert reply.status == 409
+        assert await reply.json() == {"error": "batch_conflict", "saved": False}
+
+        # Same-value replay is harmless and the untouched manifest can finish.
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "display_name", "After", manifest=manifest, batch_id=batch_id),
+            headers=HEADERS,
+        )
+        assert reply.status == 200
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "guest:0", "Alicia", manifest=manifest, batch_id=batch_id),
+            headers=HEADERS,
+        )
+        assert reply.status == 200
+    assert get_responses(event.event_name)[0].display_name == "Before"
+
+
+async def test_replayed_commit_returns_unknown_without_a_second_dm(names_setup):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    body = payload(event, current)
+    commit = None
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post(
+            "/registrations/names",
+            json=stage_body(event, body, "display_name", "After", manifest=["display_name"]),
+            headers=HEADERS,
+        )
+        batch_id = (await reply.json())["batch_id"]
+        commit = commit_body(event, body, ["display_name"], batch_id)
+        reply = await http.post("/registrations/names", json=commit, headers=HEADERS)
+        assert reply.status == 200
+        assert client.get_user.return_value.send.await_count == 1
+        saved_disk = path.read_bytes()
+
+        reply = await http.post("/registrations/names", json=commit, headers=HEADERS)
+        result = await reply.json()
+    assert reply.status == 409
+    assert result == {"error": "batch_unknown", "unconfirmed": True}
+    assert "saved" not in result
+    assert path.read_bytes() == saved_disk
+    assert client.get_user.return_value.send.await_count == 1

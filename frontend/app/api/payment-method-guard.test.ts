@@ -25,6 +25,7 @@ test('actual paid route rejects pending new choices before writes and preserves 
       }
     }
     compile('app/api', path.join(dir, 'api'))
+    compile('app/lib', path.join(dir, 'lib'))
     const data = path.join(dir, 'data')
     fs.mkdirSync(data)
     process.env.BOT_DATA_DIR = data

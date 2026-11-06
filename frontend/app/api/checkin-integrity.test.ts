@@ -81,6 +81,7 @@ test('actual routes bind arrivals to the current registration, not signup promis
     assert.equal(first.record.registration_timestamp, canonical(stampA))
     assert.equal((await pass()).attendee.arrival_confirmed, true)
     assert.equal((await roster()).attendees[0].registration_timestamp, canonical(stampA))
+    assert.match((await roster()).attendees[0].names_revision, /^[0-9a-f]{64}$/)
     assert.equal((await (await route.POST(manual(canonical(stampA)))).json()).already_checked_in, true)
 
     // Import/withdraw-and-re-register: same user, new registration and three guests.

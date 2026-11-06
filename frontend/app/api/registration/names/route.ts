@@ -7,9 +7,12 @@ export const dynamic = 'force-dynamic'
 
 const MAX_DISPLAY_NAME_LENGTH = 32
 const MAX_GUEST_NAME_LENGTH = 160
-const MAX_EXTRA_PEOPLE = 5
-// Mirrors the bot's names-only allowance. Other admin routes retain 4 KiB.
-const MAX_NAME_EDIT_REQUEST_BYTES = 16 * 1024
+// Name edits use bounded field parts plus one commit, so every request fits the
+// same 4 KiB application limit as every other admin route.
+const MAX_NAME_EDIT_REQUEST_BYTES = 4096
+const MANIFEST_FIELD = /^(?:display_name|guest:[0-4])$/
+const BATCH_ID = /^[A-Za-z0-9_-]{20,100}$/
+const NAMES_REVISION = /^[0-9a-f]{64}$/
 
 type BoundedJson = { kind: 'ok'; value: unknown } | { kind: 'too_large' } | { kind: 'invalid' }
 
@@ -78,74 +81,79 @@ async function readBoundedJson(request: NextRequest): Promise<BoundedJson> {
   }
 }
 
-type NamesBody = {
+type NamesIdentity = {
   event_name: string
   user_id: string
   registration_timestamp: string
-  expected: { display_name: string | null; extra_people: number; extras_names: (string | null)[] }
-  changes: { display_name?: string; extras_names?: { index: number; value: string }[] }
+  expected_revision: string
+  manifest: string[]
+}
+type StageBody = NamesIdentity & { operation: 'stage'; field: string; value: string; batch_id?: string }
+type CommitBody = NamesIdentity & { operation: 'commit'; batch_id: string }
+type NamesBody = StageBody | CommitBody
+
+function exactKeys(body: Record<string, unknown>, required: string[], optional: string[] = []): boolean {
+  const keys = Object.keys(body)
+  return required.every(key => keys.includes(key)) &&
+    keys.every(key => required.includes(key) || optional.includes(key))
 }
 
-// Structural validation only; the bot validates trimmed/length policy against
-// its current record immediately before the atomic commit.
-function parseNamesBody(raw: unknown): NamesBody | null {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
-  const body = raw as Record<string, unknown>
-  if (Object.keys(body).sort().join(',') !== 'changes,event_name,expected,registration_timestamp,user_id') return null
+function parseManifest(raw: unknown): string[] | null {
+  if (!Array.isArray(raw) || raw.length < 1 || raw.length > 6) return null
+  if (!raw.every(value => typeof value === 'string' && MANIFEST_FIELD.test(value))) return null
+  return new Set(raw).size === raw.length ? raw as string[] : null
+}
+
+function parseIdentity(body: Record<string, unknown>): NamesIdentity | null {
   const eventName = parseEventParam(body.event_name)
   const userId = typeof body.user_id === 'string' ? parseUserId(body.user_id) : null
-  if (!eventName || !userId || !/^[0-9]{16,22}$/.test(userId) || !/^[0-9]{16,22}$/.test(body.user_id as string) ||
-      typeof body.registration_timestamp !== 'string' || !Number.isFinite(Date.parse(body.registration_timestamp))) return null
-  const expected = body.expected
-  if (!expected || typeof expected !== 'object' || Array.isArray(expected)) return null
-  const snapshot = expected as Record<string, unknown>
-  if (Object.keys(snapshot).sort().join(',') !== 'display_name,extra_people,extras_names') return null
-  if (snapshot.display_name !== null && typeof snapshot.display_name !== 'string') return null
-  if (typeof snapshot.extra_people !== 'number' || !Number.isInteger(snapshot.extra_people) ||
-      snapshot.extra_people < 0 || snapshot.extra_people > MAX_EXTRA_PEOPLE) return null
-  const extraPeople = snapshot.extra_people as number
-  const extras = snapshot.extras_names
-  if (!Array.isArray(extras) || extras.length < extraPeople) return null
-  if (!extras.every((slot, index) => index < extraPeople
-    ? slot === null || typeof slot === 'string' : typeof slot === 'string')) return null
-  const changes = body.changes
-  if (!changes || typeof changes !== 'object' || Array.isArray(changes)) return null
-  const patch = changes as Record<string, unknown>
-  const patchKeys = Object.keys(patch)
-  if (!patchKeys.length || patchKeys.some(key => key !== 'display_name' && key !== 'extras_names')) return null
-  if ('display_name' in patch &&
-      (typeof patch.display_name !== 'string' || !patch.display_name.trim() ||
-        patch.display_name.trim().length > MAX_DISPLAY_NAME_LENGTH)) return null
-  const guestChanges = patch.extras_names
-  if (guestChanges !== undefined) {
-    if (!Array.isArray(guestChanges)) return null
-    const indices = new Set<number>()
-    for (const change of guestChanges) {
-      if (!change || typeof change !== 'object' || Array.isArray(change)) return null
-      const entry = change as Record<string, unknown>
-      if (Object.keys(entry).sort().join(',') !== 'index,value') return null
-      const index = entry.index
-      if (typeof index !== 'number' || !Number.isInteger(index) || index < 0 || index >= snapshot.extra_people ||
-          indices.has(index) || typeof entry.value !== 'string' || !entry.value.trim() ||
-          entry.value.trim().length > MAX_GUEST_NAME_LENGTH) return null
-      indices.add(index)
-    }
-  }
-  if (patch.display_name === undefined && (!guestChanges || guestChanges.length === 0)) return null
+  if (!eventName || !userId || !/^[0-9]{16,22}$/.test(userId) ||
+      typeof body.registration_timestamp !== 'string' ||
+      !Number.isFinite(Date.parse(body.registration_timestamp)) ||
+      typeof body.expected_revision !== 'string' || !NAMES_REVISION.test(body.expected_revision)) return null
+  const manifest = parseManifest(body.manifest)
+  if (!manifest) return null
   return {
     event_name: eventName,
     user_id: userId,
     registration_timestamp: registrationTimestamp(body.registration_timestamp),
-    expected: {
-      display_name: snapshot.display_name as string | null,
-      extra_people: extraPeople,
-      extras_names: extras as (string | null)[],
-    },
-    changes: {
-      ...(patch.display_name !== undefined ? { display_name: patch.display_name as string } : {}),
-      ...(guestChanges !== undefined ? { extras_names: guestChanges as { index: number; value: string }[] } : {}),
-    },
+    expected_revision: body.expected_revision,
+    manifest,
   }
+}
+
+// Structural validation only; the bot owns field-length policy against its
+// current record and validates the revision immediately before the atomic commit.
+function parseNamesBody(raw: unknown): NamesBody | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const body = raw as Record<string, unknown>
+  if (body.operation === 'stage') {
+    if (!exactKeys(body, ['operation', 'event_name', 'user_id', 'registration_timestamp',
+      'expected_revision', 'manifest', 'field', 'value'], ['batch_id'])) return null
+    const identity = parseIdentity(body)
+    if (!identity) return null
+    const field = body.field
+    if (typeof field !== 'string' || !MANIFEST_FIELD.test(field) || !identity.manifest.includes(field)) return null
+    const maximum = field === 'display_name' ? MAX_DISPLAY_NAME_LENGTH : MAX_GUEST_NAME_LENGTH
+    if (typeof body.value !== 'string' || !body.value.trim() || body.value.length > maximum) return null
+    if (body.batch_id !== undefined &&
+        (typeof body.batch_id !== 'string' || !BATCH_ID.test(body.batch_id))) return null
+    return {
+      operation: 'stage',
+      ...identity,
+      field,
+      value: body.value,
+      ...(body.batch_id !== undefined ? { batch_id: body.batch_id as string } : {}),
+    }
+  }
+  if (body.operation === 'commit') {
+    if (!exactKeys(body, ['operation', 'event_name', 'user_id', 'registration_timestamp',
+      'expected_revision', 'manifest', 'batch_id'])) return null
+    const identity = parseIdentity(body)
+    if (!identity || typeof body.batch_id !== 'string' || !BATCH_ID.test(body.batch_id)) return null
+    return { operation: 'commit', ...identity, batch_id: body.batch_id }
+  }
+  return null
 }
 
 export async function POST(request: NextRequest) {

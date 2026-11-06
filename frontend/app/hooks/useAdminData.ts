@@ -5,8 +5,8 @@ import { matchesCheckin } from '../lib/checkin'
 
 const groupSize = (a: Attendee) => 1 + (a.extra_people ?? 0)
 
-export type NamesSaveOutcome = 'saved' | 'conflict' | 'invalid' | 'too_large' | 'unconfirmed' | 'error' | 'stale'
-export type NamesExpected = { display_name: string | null; extra_people: number; extras_names: (string | null)[] }
+export type NamesSaveOutcome =
+  | 'saved' | 'conflict' | 'invalid' | 'too_large' | 'unconfirmed' | 'busy' | 'expired' | 'error' | 'stale'
 export type NamesChanges = { display_name?: string; extras_names?: { index: number; value: string }[] }
 
 // Owns admin auth + the selected event's attendees/check-ins, the manual
@@ -192,21 +192,29 @@ export function useAdminData() {
     return true
   }, [key, selectedEvent, eventName, loadAttendees])
 
-  // Persist only the edited name fields using the raw snapshot captured when the
-  // editor opened. The bot rechecks that snapshot immediately before its atomic
-  // write; polling never updates this snapshot. A lost response refreshes to
-  // confirm, and the mutation is never retried automatically.
+  // Persist one logical editor save as bounded field parts followed by a single
+  // atomic commit. No roster state changes during staging, and the one DM is sent
+  // only after the commit. A lost final response refreshes without retrying.
   const saveAttendeeNames = useCallback(async (
     requestedEvent: string,
     userId: string,
     timestamp: string,
-    expected: NamesExpected,
+    expectedRevision: string,
     changes: NamesChanges,
   ): Promise<NamesSaveOutcome> => {
     if (!eventName || eventName !== selectedEvent || selectedEventRef.current !== eventName ||
         requestedEvent !== eventName) return 'stale'
     if (!attendeesRef.current.some(a => a.status === 'attending' && a.user_id === userId &&
         a.registration_timestamp === timestamp)) return 'stale'
+    if (!/^[0-9a-f]{64}$/.test(expectedRevision)) return 'invalid'
+    const parts: { field: string; value: string }[] = []
+    if (changes.display_name !== undefined) parts.push({ field: 'display_name', value: changes.display_name })
+    for (const change of changes.extras_names ?? []) {
+      if (!Number.isInteger(change.index) || change.index < 0 || change.index > 4) return 'invalid'
+      parts.push({ field: `guest:${change.index}`, value: change.value })
+    }
+    const manifest = parts.map(part => part.field)
+    if (!parts.length || new Set(manifest).size !== manifest.length) return 'invalid'
     const generation = eventGeneration.current
     const stillCurrent = () => generation === eventGeneration.current && selectedEventRef.current === eventName
     let response: Response | undefined
@@ -214,20 +222,10 @@ export function useAdminData() {
       saved?: boolean
       error?: string
       warnings?: string[]
+      batch_id?: string
       registration?: { user_id?: string; registration_timestamp?: string; display_name?: string | null
-        extra_people?: number; extras_names?: string[] }
+        extra_people?: number; extras_names?: string[]; names_revision?: string }
     } = {}
-    try {
-      response = await fetch('/api/registration/names?key=' + encodeURIComponent(key), {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ event_name: eventName, user_id: userId, registration_timestamp: timestamp,
-          expected, changes }),
-      })
-      result = await response.json().catch(() => ({}))
-    } catch {
-      // A timeout can follow a committed save. Refresh to confirm; never retry it automatically.
-    }
-    if (!stillCurrent()) return 'stale'
 
     // A refresh failure or timeout must never turn a confirmed save into a reported failure.
     const refresh = async () => {
@@ -241,14 +239,76 @@ export function useAdminData() {
         if (timer) clearTimeout(timer)
       }
     }
+    const identity = { event_name: eventName, user_id: userId, registration_timestamp: timestamp,
+      expected_revision: expectedRevision, manifest }
+    const post = async (body: unknown) => {
+      const encoded = JSON.stringify(body)
+      // Every request must fit the application's 4 KiB limit; never depend on a
+      // proxy or server to discover an oversized part.
+      if (new TextEncoder().encode(encoded).byteLength > 4096) return null
+      const res = await fetch('/api/registration/names?key=' + encodeURIComponent(key), {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: encoded,
+      })
+      return { res, data: await res.json().catch(() => ({})) }
+    }
+
+    let batchId: string | undefined
+    for (const part of parts) {
+      let staged: Awaited<ReturnType<typeof post>>
+      try {
+        staged = await post({ operation: 'stage', ...identity, field: part.field, value: part.value,
+          ...(batchId ? { batch_id: batchId } : {}) })
+      } catch {
+        // Staging never writes a roster, so a lost stage response is a plain
+        // failure; the pending batch simply expires. Do not auto-retry.
+        return stillCurrent() ? 'error' : 'stale'
+      }
+      if (!stillCurrent()) return 'stale'
+      if (!staged) return 'too_large'
+      const { res, data } = staged
+      if (!res.ok) {
+        if (res.status === 413) return 'too_large'
+        if (res.status === 400) return 'invalid'
+        if (res.status === 409) {
+          if (data.error === 'batch_busy') return 'busy'
+          if (data.error === 'batch_expired' || data.error === 'batch_unknown') return 'expired'
+          if (data.error === 'batch_context_mismatch' || data.error === 'batch_conflict') {
+            await refresh()
+            return stillCurrent() ? 'conflict' : 'stale'
+          }
+        }
+        return 'error'
+      }
+      if (typeof data.batch_id !== 'string' || !/^[A-Za-z0-9_-]{20,100}$/.test(data.batch_id)) return 'error'
+      batchId = data.batch_id
+    }
+    if (!batchId) return 'error'
+
+    try {
+      response = undefined
+      result = {}
+      const committed = await post({ operation: 'commit', ...identity, batch_id: batchId })
+      if (!committed) return 'too_large'
+      response = committed.res
+      result = committed.data
+    } catch {
+      // A timeout can follow a committed save. Refresh to confirm; never retry it automatically.
+    }
+    if (!stillCurrent()) return 'stale'
+
     const registration = result.registration
     const returnedDisplayName = registration?.display_name
     const returnedExtrasNames = registration?.extras_names
+    const returnedRevision = registration?.names_revision
+    const validGuestCount = Number.isInteger(registration?.extra_people) &&
+      (registration?.extra_people ?? -1) >= 0 && (registration?.extra_people ?? 6) <= 5
+    const validReturnedRevision = typeof returnedRevision === 'string' && /^[0-9a-f]{64}$/.test(returnedRevision)
     const validRegistration = !!registration &&
       registration.user_id === userId &&
       typeof registration.registration_timestamp === 'string' &&
       Date.parse(registration.registration_timestamp) === Date.parse(timestamp) &&
-      registration.extra_people === expected.extra_people &&
+      validGuestCount &&
+      validReturnedRevision &&
       (returnedDisplayName === null || typeof returnedDisplayName === 'string') &&
       Array.isArray(returnedExtrasNames) &&
       returnedExtrasNames.every(name => typeof name === 'string')
@@ -258,14 +318,19 @@ export function useAdminData() {
       // Invalidate any poll that began before this confirmed write, then show the
       // persisted names immediately even if the follow-up refresh fails.
       attendeeLoadId.current += 1
-      const names: Pick<Attendee, 'display_name' | 'extras_names'> = {
+      const committedRevision = returnedRevision as string
+      const names: Pick<Attendee, 'display_name' | 'extras_names' | 'names_revision'> = {
         display_name: returnedDisplayName,
         extras_names: [...returnedExtrasNames],
+        names_revision: committedRevision,
       }
-      const applyNames = (list: Attendee[]) => list.map(a =>
-        a.status === 'attending' && a.user_id === userId && a.registration_timestamp === timestamp
-          ? { ...a, ...names }
-          : a)
+      const applyNames = (list: Attendee[]) => list.map(a => {
+        if (a.status !== 'attending' || a.user_id !== userId || a.registration_timestamp !== timestamp) return a
+        // Never let an older save replace a newer known names state (another
+        // admin/poll). Unrelated bot updates keep the revision and still apply.
+        if (a.names_revision !== expectedRevision && a.names_revision !== committedRevision) return a
+        return { ...a, ...names }
+      })
       setAttendees(applyNames)
       attendeesRef.current = applyNames(attendeesRef.current)
       await refresh()
@@ -282,9 +347,18 @@ export function useAdminData() {
     if (response?.status === 400) return 'invalid'
     if (response?.status === 401) return 'error'
     if (response?.status === 500 && result.error === 'write_failed') return 'error'
-    if (response?.status === 409 || response?.status === 404) {
-      await refresh()
-      return stillCurrent() ? 'conflict' : 'stale'
+    if (response?.status === 409) {
+      if (result.error === 'registration_changed' || result.error === 'batch_context_mismatch') {
+        await refresh()
+        return stillCurrent() ? 'conflict' : 'stale'
+      }
+      if (result.error === 'batch_unknown') {
+        // The batch may already have committed before the response was lost.
+        await refresh()
+        return stillCurrent() ? 'unconfirmed' : 'stale'
+      }
+      if (result.error === 'batch_expired') return 'expired'
+      return 'error'
     }
     // Unknown or ambiguous transport outcome: refresh without claiming a result.
     await refresh()

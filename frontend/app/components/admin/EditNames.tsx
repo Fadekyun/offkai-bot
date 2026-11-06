@@ -2,7 +2,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useT } from '../../lib/i18n'
 import type { Attendee } from '../../lib/types'
-import type { NamesChanges, NamesExpected, NamesSaveOutcome } from '../../hooks/useAdminData'
+import type { NamesChanges, NamesSaveOutcome } from '../../hooks/useAdminData'
 
 const MAX_DISPLAY_NAME_LENGTH = 32
 const MAX_GUEST_NAME_LENGTH = 160
@@ -12,14 +12,14 @@ type Draft = {
   eventName: string
   userId: string
   timestamp: string
+  namesRevision: string
   originalDisplayName: string | null
-  originalExtraPeople: number
   originalExtrasNames: (string | null)[]
   displayNameInput: string
   guestInputs: string[]
 }
 
-type ErrorKind = 'invalid' | 'conflict' | 'too_large' | 'unconfirmed' | 'error' | 'unchanged'
+type ErrorKind = 'invalid' | 'conflict' | 'too_large' | 'unconfirmed' | 'busy' | 'expired' | 'error' | 'unchanged'
 
 function buildChanges(draft: Draft): { changes: NamesChanges | null; invalid: boolean } {
   const changes: NamesChanges = {}
@@ -45,7 +45,7 @@ function buildChanges(draft: Draft): { changes: NamesChanges | null; invalid: bo
 export function EditNames({ attendee, eventName, onSave }: {
   attendee: Attendee
   eventName: string
-  onSave: (eventName: string, userId: string, timestamp: string, expected: NamesExpected,
+  onSave: (eventName: string, userId: string, timestamp: string, expectedRevision: string,
     changes: NamesChanges) => Promise<NamesSaveOutcome>
 }) {
   const { t } = useT()
@@ -84,7 +84,8 @@ export function EditNames({ attendee, eventName, onSave }: {
   }, [activeDraft])
 
   function open() {
-    if (attendee.status !== 'attending' || !attendee.registration_timestamp) return
+    if (attendee.status !== 'attending' || !attendee.registration_timestamp ||
+        typeof attendee.names_revision !== 'string') return
     requestToken.current += 1
     inFlight.current = false
     setBusy(false)
@@ -99,8 +100,8 @@ export function EditNames({ attendee, eventName, onSave }: {
       eventName,
       userId: attendee.user_id,
       timestamp: attendee.registration_timestamp,
+      namesRevision: attendee.names_revision,
       originalDisplayName: attendee.display_name ?? null,
-      originalExtraPeople: attendee.extra_people,
       originalExtrasNames,
       displayNameInput: attendee.display_name ?? '',
       guestInputs: Array.from({ length: attendee.extra_people },
@@ -129,11 +130,13 @@ export function EditNames({ attendee, eventName, onSave }: {
     setError(null)
     let outcome: NamesSaveOutcome
     try {
-      outcome = await onSave(activeDraft.eventName, activeDraft.userId, activeDraft.timestamp, {
-        display_name: activeDraft.originalDisplayName,
-        extra_people: activeDraft.originalExtraPeople,
-        extras_names: activeDraft.originalExtrasNames,
-      }, result.changes)
+      outcome = await onSave(
+        activeDraft.eventName,
+        activeDraft.userId,
+        activeDraft.timestamp,
+        activeDraft.namesRevision,
+        result.changes,
+      )
     } catch {
       outcome = 'unconfirmed'
     } finally {
@@ -150,6 +153,8 @@ export function EditNames({ attendee, eventName, onSave }: {
     if (outcome === 'conflict' || outcome === 'unconfirmed') { setDraft(null); setError(outcome); return }
     if (outcome === 'invalid') { setError('invalid'); return }
     if (outcome === 'too_large') { setError('too_large'); return }
+    if (outcome === 'busy') { setError('busy'); return }
+    if (outcome === 'expired') { setError('expired'); return }
     setError('error')
   }
 
@@ -158,15 +163,17 @@ export function EditNames({ attendee, eventName, onSave }: {
     : error === 'conflict' ? t.namesConflict
       : error === 'too_large' ? t.namesTooLarge
         : error === 'unconfirmed' ? t.namesUnconfirmed
-          : error === 'unchanged' ? t.namesNoChanges
-            : t.namesSaveError
+          : error === 'busy' ? t.namesBusy
+            : error === 'expired' ? t.namesExpired
+              : error === 'unchanged' ? t.namesNoChanges
+                : t.namesSaveError
 
   return (
     <div className="relative text-xs">
       <button
         type="button"
         className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl border-2 border-[#17120F] bg-blue-50 text-blue-800 transition active:translate-x-[1px] active:translate-y-[1px]"
-        disabled={!attendee.registration_timestamp}
+        disabled={!attendee.registration_timestamp || typeof attendee.names_revision !== 'string'}
         onClick={open}
         aria-label={t.editNames}
         title={t.editNames}

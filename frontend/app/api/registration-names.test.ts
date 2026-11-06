@@ -30,16 +30,14 @@ const identity = {
   event_name: 'Test event',
   user_id: '191524132624531458',
   registration_timestamp: '2026-10-01T00:00:00.123456Z',
+  expected_revision: 'a'.repeat(64),
+  manifest: ['display_name', 'guest:0'],
 }
-const expected = {
-  display_name: 'Before',
-  extra_people: 2,
-  extras_names: ['Alice', null] as (string | null)[],
-}
-const changes = { display_name: 'After', extras_names: [{ index: 0, value: '  Alicia  ' }] }
-const body = { ...identity, expected, changes }
+const stage = { operation: 'stage', ...identity, field: 'display_name', value: 'After' }
+const commit = { operation: 'commit', ...identity, batch_id: 'b'.repeat(32) }
+const normalizedTimestamp = '2026-10-01T00:00:00.123Z'
 
-test('names route requires organizer auth and validates malformed payloads before forwarding', async () => {
+test('names route requires organizer auth and validates staged and commit payloads before forwarding', async () => {
   const route = await loadRoute()
   const previousFetch = globalThis.fetch
   const previousKey = process.env.ADMIN_KEY
@@ -47,32 +45,37 @@ test('names route requires organizer auth and validates malformed payloads befor
   try {
     process.env.ADMIN_KEY = 'synthetic-admin'
     process.env.BOT_ADMIN_URL = 'http://synthetic-bot.invalid'
-    const request = (key = 'synthetic-admin', payload: unknown = body) => new NextRequest(
+    const request = (key = 'synthetic-admin', payload: unknown = stage) => new NextRequest(
       `http://localhost/api/registration/names?key=${key}`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload),
       })
     const posts: { url: string; init: RequestInit }[] = []
     globalThis.fetch = async (url, init) => {
       posts.push({ url: String(url), init: init! })
-      return Response.json({ saved: true, registration: { ...identity, ...changes } })
+      return Response.json({ batch_id: 'c'.repeat(32), staged: 'display_name', complete: true })
     }
 
     assert.equal((await route.POST(request('user-token'))).status, 401)
     const invalidPayloads = [
       null,
-      { ...body, user_id: 123 },
-      { ...body, user_id: '123' },
-      { ...body, registration_timestamp: 'not-a-time' },
-      { ...body, unexpected: true },
-      { ...body, expected: { ...expected, extra_people: 1 } },
-      { ...body, expected: { ...expected, extras_names: ['Alice', 3] } },
-      { ...body, changes: {} },
-      { ...body, changes: { display_name: '   ' } },
-      { ...body, changes: { display_name: 'x'.repeat(33) } },
-      { ...body, changes: { extras_names: [{ index: 2, value: 'Nope' }] } },
-      { ...body, changes: { extras_names: [{ index: 0, value: 'One' }, { index: 0, value: 'Two' }] } },
-      { ...body, changes: { extras_names: [{ index: 0, value: 'x'.repeat(161) }] } },
-      { ...body, changes: { unknown: 'value' } },
+      { ...stage, user_id: 123 },
+      { ...stage, user_id: '123' },
+      { ...stage, registration_timestamp: 'not-a-time' },
+      { ...stage, expected_revision: 'A'.repeat(64) },
+      { ...stage, expected_revision: 'a'.repeat(63) },
+      { ...stage, unexpected: true },
+      { ...stage, operation: 'upload' },
+      { ...stage, manifest: [] },
+      { ...stage, manifest: ['display_name', 'display_name'] },
+      { ...stage, manifest: ['guest:5'] },
+      { ...stage, manifest: ['guest:0'] },
+      { ...stage, field: 'guest:1' },
+      { ...stage, value: '   ' },
+      { ...stage, value: 'x'.repeat(33) },
+      { ...stage, batch_id: 'short' },
+      { ...commit, batch_id: undefined },
+      { ...commit, batch_id: 'short' },
+      { ...commit, value: 'unexpected' },
     ]
     for (const payload of invalidPayloads) {
       const response = await route.POST(request('synthetic-admin', payload))
@@ -81,24 +84,33 @@ test('names route requires organizer auth and validates malformed payloads befor
     }
     assert.equal(posts.length, 0)
 
-    const success = await route.POST(request())
-    assert.equal(success.status, 200)
-    assert.deepEqual(await success.json(), { saved: true, registration: { ...identity, ...changes } })
+    const staged = await route.POST(request())
+    assert.equal(staged.status, 200)
+    assert.deepEqual(await staged.json(), { batch_id: 'c'.repeat(32), staged: 'display_name', complete: true })
     assert.equal(posts.length, 1)
     assert.equal(posts[0].url, 'http://synthetic-bot.invalid/registrations/names')
     assert.equal(new Headers(posts[0].init.headers).get('authorization'), 'Bearer synthetic-admin')
     assert.deepEqual(JSON.parse(posts[0].init.body as string), {
-      ...identity,
-      registration_timestamp: '2026-10-01T00:00:00.123Z',
-      expected,
-      changes,
+      ...stage,
+      registration_timestamp: normalizedTimestamp,
     })
-    // Surplus legacy guest entries are part of the conflict snapshot and are forwarded verbatim.
-    const surplusExpected = { ...expected, extras_names: ['Alice', null, 'Legacy surplus'] }
-    const surplus = await route.POST(request('synthetic-admin', { ...body, expected: surplusExpected }))
-    assert.equal(surplus.status, 200)
+
+    globalThis.fetch = async (url, init) => {
+      posts.push({ url: String(url), init: init! })
+      return Response.json({ saved: true, registration: { ...identity, display_name: 'After' } })
+    }
+    const committed = await route.POST(request('synthetic-admin', commit))
+    assert.equal(committed.status, 200)
     assert.equal(posts.length, 2)
-    assert.deepEqual(JSON.parse(posts[1].init.body as string).expected, surplusExpected)
+    assert.deepEqual(JSON.parse(posts[1].init.body as string), {
+      ...commit,
+      registration_timestamp: normalizedTimestamp,
+    })
+
+    // A guest value at the maximum bound is accepted as one bounded part.
+    const guest = { ...stage, field: 'guest:0', value: '😀'.repeat(80) }
+    assert.equal((await route.POST(request('synthetic-admin', guest))).status, 200)
+    assert.equal(posts.length, 3)
   } finally {
     globalThis.fetch = previousFetch
     if (previousKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = previousKey
@@ -108,7 +120,7 @@ test('names route requires organizer auth and validates malformed payloads befor
 })
 
 
-test('names route bounds incoming raw UTF-8 bytes and classifies backend plain 413 explicitly', async () => {
+test('names route bounds incoming raw UTF-8 bytes at 4 KiB and classifies backend plain 413 explicitly', async () => {
   const route = await loadRoute()
   const previousFetch = globalThis.fetch
   const previousKey = process.env.ADMIN_KEY
@@ -120,23 +132,18 @@ test('names route bounds incoming raw UTF-8 bytes and classifies backend plain 4
     const posts: { init: RequestInit }[] = []
     globalThis.fetch = async (_url, init) => {
       posts.push({ init: init! })
-      return Response.json({ saved: true, registration: { ...identity, ...changes } })
+      return Response.json({ batch_id: 'c'.repeat(32), staged: 'display_name', complete: true })
     }
-    const raw = JSON.stringify(body)
-    const exact = raw + ' '.repeat(16384 - Buffer.byteLength(raw, 'utf8'))
+    const raw = JSON.stringify(stage)
+    const exact = raw + ' '.repeat(4096 - Buffer.byteLength(raw, 'utf8'))
     const exactResponse = await route.POST(new NextRequest(url, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: exact,
     }))
     assert.equal(exactResponse.status, 200)
     assert.equal(posts.length, 1)
     const forwarded = String(posts[0].init.body)
-    assert.ok(Buffer.byteLength(forwarded, 'utf8') <= 16384)
-    assert.deepEqual(JSON.parse(forwarded), {
-      ...identity,
-      registration_timestamp: '2026-10-01T00:00:00.123Z',
-      expected,
-      changes,
-    })
+    assert.ok(Buffer.byteLength(forwarded, 'utf8') <= 4096)
+    assert.deepEqual(JSON.parse(forwarded), { ...stage, registration_timestamp: normalizedTimestamp })
 
     const over = exact + ' '
     const overResponse = await route.POST(new NextRequest(url, {
@@ -151,7 +158,7 @@ test('names route bounds incoming raw UTF-8 bytes and classifies backend plain 4
     let cancelled = false
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
-        controller.enqueue(new TextEncoder().encode('x'.repeat(17000)))
+        controller.enqueue(new TextEncoder().encode('x'.repeat(4100)))
       },
       cancel() { cancelled = true },
     })
@@ -169,7 +176,7 @@ test('names route bounds incoming raw UTF-8 bytes and classifies backend plain 4
 
     globalThis.fetch = async (_url, init) => {
       posts.push({ init: init! })
-      return new Response('Maximum request body size 16384 exceeded.', {
+      return new Response('Maximum request body size 4096 exceeded.', {
         status: 413, headers: { 'Content-Type': 'text/plain; charset=utf-8' },
       })
     }
@@ -186,7 +193,6 @@ test('names route bounds incoming raw UTF-8 bytes and classifies backend plain 4
     route.cleanup()
   }
 })
-
 
 
 const promptly = async <T>(promise: Promise<T>): Promise<T> => {
@@ -218,12 +224,12 @@ test('names route rejects stalled overflow and stalled backend 413 without await
     for (const declared of [true, false]) {
       let cancels = 0
       const stream = new ReadableStream<Uint8Array>({
-        start(controller) { controller.enqueue(new Uint8Array(16385)) },
+        start(controller) { controller.enqueue(new Uint8Array(4097)) },
         cancel() { cancels++; return new Promise(() => {}) },
       })
       const request = new NextRequest(url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', ...(declared ? { 'Content-Length': '16385' } : {}) },
+        headers: { 'Content-Type': 'application/json', ...(declared ? { 'Content-Length': '4097' } : {}) },
         body: stream,
         duplex: 'half',
       } as unknown as ConstructorParameters<typeof NextRequest>[1])
@@ -239,7 +245,7 @@ test('names route rejects stalled overflow and stalled backend 413 without await
       cancel() { responseCancels++; return new Promise(() => {}) },
     }), { status: 413 })
     const stalled413 = await promptly<Response>(route.POST(new NextRequest(url, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(stage),
     })))
     assert.equal(stalled413.status, 413)
     assert.deepEqual(await stalled413.json(), { error: 'request_too_large', saved: false })
@@ -263,7 +269,7 @@ test('names route forwards conflicts unchanged and never retries an uncertain co
     process.env.ADMIN_KEY = 'synthetic-admin'
     process.env.BOT_ADMIN_URL = 'http://synthetic-bot.invalid'
     const request = () => new NextRequest('http://localhost/api/registration/names?key=synthetic-admin', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(commit),
     })
     let calls = 0
     globalThis.fetch = async () => {

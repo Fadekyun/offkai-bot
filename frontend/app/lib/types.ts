@@ -12,6 +12,7 @@ export type Attendee = {
   drinks: string[]
   extra_people: number
   extras_names: string[]
+  names_revision?: string
   attendee_number: number | null
   extras_attendee_numbers: number[]
   payment_enabled?: boolean

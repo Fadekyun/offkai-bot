@@ -50,7 +50,7 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
       editNames:'Edit names',attendeeName:'Attendee name',guestName:n=>'Guest '+n+' name',
       unnamedGuest:'Unnamed guest',saveNames:'Save names',cancel:'Cancel',namesSaved:'Names saved.',
       namesNoChanges:'No changes to save.',namesInvalid:'Invalid names',
-      namesConflict:'Registration changed',namesUnconfirmed:'Unconfirmed',namesSaveError:'Save error',
+      namesConflict:'Registration changed',namesUnconfirmed:'Unconfirmed',namesBusy:'Too busy',namesExpired:'Session expired',namesSaveError:'Save error',
       namesTooLarge:'Edit too large'}};}`)
     const code = ts.transpileModule(fs.readFileSync('app/components/admin/EditNames.tsx', 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
@@ -63,6 +63,7 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
       user_id: '191524132624531458', username: 'synthetic', display_name: 'Before',
       drinks: [], extra_people: 2, extras_names: ['Alice'], attendee_number: 1,
       extras_attendee_numbers: [2, 3], status: 'attending', registration_timestamp: '2026-10-01T00:00:00.123Z',
+      names_revision: 'a'.repeat(64),
     }
     const calls: unknown[][] = []
     let outcome = 'saved'
@@ -98,8 +99,7 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
     const form = find(dialog, element => element.type === 'form')
     await (form!.props.onSubmit as (event: unknown) => Promise<void>)({ preventDefault() {} })
     assert.deepEqual(calls[0], [
-      'Test event', attendee.user_id, attendee.registration_timestamp,
-      { display_name: 'Before', extra_people: 2, extras_names: ['Alice', null] },
+      'Test event', attendee.user_id, attendee.registration_timestamp, 'a'.repeat(64),
       { display_name: 'Draft' },
     ])
     tree = render()
@@ -120,6 +120,25 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
       tree = render()
       assert.equal(find(tree, element => element.props.role === 'dialog'), undefined)
       assert.equal(find(tree, element => element.props.role === 'alert')?.props.children, expected)
+    }
+
+    // Busy and expired sessions keep the draft with clear localized errors.
+    for (const [failure, expected] of [['busy', 'Too busy'], ['expired', 'Session expired']] as const) {
+      const beforeBusy = calls.length
+      outcome = failure
+      tree = openWith()
+      dialog = find(tree, element => element.props.role === 'dialog')
+      inputs = collect(dialog).filter(element => element.type === 'input')
+      ;(inputs[0].props.onChange as (event: unknown) => void)({ target: { value: 'Busy draft' } })
+      tree = render()
+      dialog = find(tree, element => element.props.role === 'dialog')
+      const failureForm = find(dialog, element => element.type === 'form')
+      await (failureForm!.props.onSubmit as (event: unknown) => Promise<void>)({ preventDefault() {} })
+      tree = render()
+      dialog = find(tree, element => element.props.role === 'dialog')
+      assert.ok(dialog)
+      assert.equal(find(dialog, element => element.props.role === 'alert')?.props.children, expected)
+      assert.equal(calls.length, beforeBusy + 1)
     }
 
     // A known too-large rejection keeps the draft and shows the localized size message.
@@ -182,7 +201,7 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
     // A legacy attendee record may omit display_name entirely. Capturing null keeps
     // the snapshot present on the wire while leaving both display-name inputs untouched.
     const legacy = { display_name: undefined, extra_people: 1, extras_names: ['Legacy Guest'],
-      extras_attendee_numbers: [2] }
+      extras_attendee_numbers: [2], names_revision: 'b'.repeat(64) }
     const beforeLegacy = calls.length
     tree = openWith(legacy)
     dialog = find(tree, element => element.props.role === 'dialog')
@@ -193,11 +212,8 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
     const legacyForm = find(dialog, element => element.type === 'form')
     await (legacyForm!.props.onSubmit as (event: unknown) => Promise<void>)({ preventDefault() {} })
     assert.equal(calls.length, beforeLegacy + 1)
-    const legacyExpected = calls.at(-1)![3] as Record<string, unknown>
+    assert.equal(calls.at(-1)![3], 'b'.repeat(64))
     const legacyChanges = calls.at(-1)![4] as Record<string, unknown>
-    assert.deepEqual(legacyExpected,
-      { display_name: null, extra_people: 1, extras_names: ['Legacy Guest'] })
-    assert.match(JSON.stringify(legacyExpected), /"display_name":null/)
     assert.deepEqual(legacyChanges, { extras_names: [{ index: 0, value: 'Legacy Updated' }] })
     assert.equal(Object.hasOwn(legacyChanges, 'display_name'), false)
 

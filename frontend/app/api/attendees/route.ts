@@ -3,6 +3,7 @@ import { readEvents, readResponses, getDefaultEvent, isSelectableForCheckin } fr
 import { paymentFromSnapshot, readPaymentSnapshot, registrationTimestamp } from '../payments'
 import { paymentEnabled, paymentMethodRequired } from '../payment-access'
 import { parseEventParam } from '../validation'
+import { namesRevision } from '../../lib/namesRevision'
 import { MOCK_EVENTS, MOCK_ATTENDEES } from '../mock'
 
 const MOCK_MODE = process.env.MOCK_MODE === 'true'
@@ -31,7 +32,13 @@ export async function GET(request: NextRequest) {
     if (!MOCK_ATTENDEES[eventName]) {
       return NextResponse.json({ error: 'event_not_found' }, { status: 404 })
     }
-    return NextResponse.json({ event_name: eventName, attendees: MOCK_ATTENDEES[eventName] })
+    return NextResponse.json({
+      event_name: eventName,
+      attendees: MOCK_ATTENDEES[eventName].map(a => ({
+        ...a,
+        names_revision: namesRevision(a.display_name ?? null, a.extra_people ?? 0, a.extras_names ?? []),
+      })),
+    })
   }
 
   const events = readEvents()
@@ -82,6 +89,7 @@ export async function GET(request: NextRequest) {
     drinks: a.drinks || [],
     extra_people: a.extra_people || 0,
     extras_names: a.extras_names || [],
+    names_revision: namesRevision(a.display_name ?? null, a.extra_people || 0, a.extras_names || []),
     attendee_number: a.attendee_number ?? null,
     extras_attendee_numbers: a.extras_attendee_numbers || [],
     status: 'attending' as const
@@ -97,6 +105,7 @@ export async function GET(request: NextRequest) {
     drinks: a.drinks || [],
     extra_people: a.extra_people || 0,
     extras_names: a.extras_names || [],
+    names_revision: namesRevision(a.display_name ?? null, a.extra_people || 0, a.extras_names || []),
     attendee_number: null,
     extras_attendee_numbers: [] as number[],
     status: 'waitlist' as const

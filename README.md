@@ -199,17 +199,19 @@ Confirmed attendees have an edit control for their event display name and their 
 Only the current guest slots are editable; the editor never adds, removes, reorders or compacts guests, and an
 untouched legacy unnamed slot is preserved. Waitlisted registrations are out of scope.
 
-The browser captures the original names when the editor opens and sends them with the edit. The bot resolves the
-event's Discord thread to enforce the configured guild boundary, then revalidates the selected event, user ID,
-registration timestamp, original names and guest slots immediately before its existing atomic JSON write. A removed,
-rejoined or promoted/demoted registration, a changed guest count, changed surplus legacy names, or another admin's
-name edit is rejected with a refresh/retry conflict instead of overwriting current data. Unrelated payment or
-check-in updates are preserved. After the atomic write, saving names sends one bilingual DM listing only the fields
-that actually changed. It does not change roles or trigger signup, payment, attendance or promotion actions, and
-previously sent event messages are not updated. If DM delivery fails, the saved names remain and the admin panel
-shows a warning. Name-edit requests are bounded to 16 KiB of JSON; oversized edits are rejected with a clear
-too-large message and are not saved. A lost response is treated as unconfirmed and the admin panel refreshes rather
-than retrying the write blindly.
+The browser captures a compact SHA-256 revision of the original names when the editor opens, not the full raw
+snapshot. One editor Save is sent as bounded per-field requests (at most the attendee name plus five guest names)
+followed by a single atomic commit. Every request stays within the application's 4 KiB JSON limit. Staging requests
+never change the roster, cache or disk. The bot resolves the event's Discord thread to enforce the configured guild
+boundary, then revalidates the selected event, user ID, registration timestamp, name revision and guest slots
+immediately before its existing atomic JSON write. A removed, rejoined or promoted/demoted registration, a changed
+guest count, changed surplus legacy names, an expired edit session, or another admin's name edit is rejected with a
+refresh/retry conflict instead of overwriting current data. Unrelated payment or check-in updates are preserved.
+After the atomic write, saving names sends one bilingual DM listing only the fields that actually changed. It does
+not change roles or trigger signup, payment, attendance or promotion actions, and previously sent event messages are
+not updated. If DM delivery fails, the saved names remain and the admin panel shows a warning. Oversized requests are
+rejected with a clear too-large message and are not saved. A lost final response is treated as unconfirmed and the
+admin panel refreshes rather than retrying the write blindly.
 
 ### Payment proof by DM
 
