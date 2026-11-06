@@ -46,7 +46,7 @@ async function loadHook() {
   return { ...react, useAdminData, cleanup: () => fs.rmSync(dir, { recursive: true, force: true }) }
 }
 
-const seed = () => ({ 0: 'synthetic-key', 1: true, 4: event, 6: event, 7: [attendee] })
+const seed = () => ({ 0: 'synthetic-key', 1: true, 4: event, 6: event, 7: [attendee], 12: [] })
 
 test('name save shows persisted names even when refresh fails, and distinguishes conflict from uncertainty', async () => {
   const hookModule = await loadHook()
@@ -61,7 +61,7 @@ test('name save shows persisted names even when refresh fails, and distinguishes
         assert.equal(String(url), '/api/registration/names?key=synthetic-key')
         assert.deepEqual(JSON.parse(options.body as string),
           { event_name: event, user_id: uid, registration_timestamp: timestamp, expected, changes })
-        return Response.json({ saved: true, registration: savedRegistration })
+        return Response.json({ saved: true, warnings: ['Notification DM failed'], registration: savedRegistration })
       }
       gets++
       throw new Error('Network disconnected during refresh')
@@ -75,6 +75,7 @@ test('name save shows persisted names even when refresh fails, and distinguishes
     const after = useAdminData()
     assert.equal(after.attendees[0].display_name, 'After')
     assert.deepEqual(after.attendees[0].extras_names, ['Alice', 'Bea'])
+    assert.deepEqual(after.actionWarnings, ['Notification DM failed'])
 
     // A conflict refreshes the roster and never reports success.
     posts = 0
@@ -218,6 +219,21 @@ test('name save is stale after an event switch and pre-save polls cannot revert 
     const afterSwitch = useAdminData()
     assert.equal(afterSwitch.selectedEvent, 'Event B')
     assert.equal(afterSwitch.attendees[0].display_name, 'Before')
+
+    // A rejoin during the post-commit refresh suppresses this operation's success warning.
+    globalThis.fetch = async (_url, options) => {
+      if (options?.method === 'POST') {
+        return Response.json({ saved: true, warnings: ['DM warning'], registration: savedRegistration })
+      }
+      return Response.json({ event_name: event, attendees: [{
+        ...attendee, registration_timestamp: '2026-10-02T00:00:00.000Z', display_name: 'Rejoined',
+      }] })
+    }
+    begin(seed(), event, { 3: [attendee] })
+    const rejoinedDuringRefresh = useAdminData()
+    assert.equal(await rejoinedDuringRefresh.saveAttendeeNames(event, uid, timestamp, expected, changes), 'stale')
+    begin()
+    assert.deepEqual(useAdminData().actionWarnings, [])
 
     // Even after the POST is confirmed, an event switch during the refresh suppresses success.
     let resolveConfirmedPost!: (value: Response) => void

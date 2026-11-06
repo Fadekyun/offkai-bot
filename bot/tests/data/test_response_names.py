@@ -10,6 +10,7 @@ import pytest
 
 from offkai_bot.data import response as response_data
 from offkai_bot.data.response import (
+    AttendeeNameChange,
     EventData,
     Response,
     WaitlistEntry,
@@ -67,7 +68,7 @@ def edit(**overrides):
         + list(current.extras_names[current.extra_people :]),
     }
     arguments.update(overrides)
-    return update_attendee_names("Names", UID, **arguments)
+    return update_attendee_names("Names", UID, **arguments).registration
 
 
 def test_roundtrip_updates_only_names_in_cache_and_on_disk(tmp_path, monkeypatch):
@@ -180,7 +181,7 @@ def test_legacy_missing_display_name_guest_only_edit_matches_loaded_null(tmp_pat
 
     loaded = response_data.get_responses("Names")[0]
     assert loaded.display_name is None
-    updated = update_attendee_names(
+    update = update_attendee_names(
         "Names",
         UID,
         NOW,
@@ -189,6 +190,8 @@ def test_legacy_missing_display_name_guest_only_edit_matches_loaded_null(tmp_pat
         ["Alice"],
         guest_names=[(0, "  Alicia  ")],
     )
+    updated = update.registration
+    assert update.changes == (AttendeeNameChange(1, "Alice", "Alicia"),)
     assert updated.display_name is None
     assert updated.extras_names == ["Alicia"]
 
@@ -218,7 +221,7 @@ def test_sparse_legacy_slots_are_preserved_or_materialised_only_when_needed(tmp_
         2,
         ["Alice", "Bob"],
         guest_names=[(1, "  Bea  ")],
-    )
+    ).registration
     assert slot_one.extras_names == ["Alice", "Bea"]
 
 
@@ -312,7 +315,7 @@ def test_two_admin_edits_conflict_and_second_does_not_overwrite_first(tmp_path, 
 
     first = update_attendee_names(
         "Names", UID, NOW, "Before", 2, ["Alice", "Bob"], display_name="First", guest_names=[(0, "Alicia")]
-    )
+    ).registration
     assert first.display_name == "First"
     with pytest.raises(RegistrationChangedError):
         update_attendee_names("Names", UID, NOW, display_name="Second", **stale_snapshot)
@@ -328,7 +331,7 @@ def test_unrelated_bot_updates_are_preserved_and_survive_later_bot_save(tmp_path
     original.behavior_confirmed = False
     response_data.save_responses()
 
-    updated = update_attendee_names("Names", UID, NOW, "Before", 2, ["Alice", "Bob"], display_name="After")
+    updated = update_attendee_names("Names", UID, NOW, "Before", 2, ["Alice", "Bob"], display_name="After").registration
     assert updated.payment_method == "PayNow"
     assert updated.payment_selection_expires_at == NOW + timedelta(hours=2)
     assert updated.behavior_confirmed is False
@@ -369,6 +372,45 @@ def test_other_attendees_and_later_bot_actions_are_preserved(tmp_path, monkeypat
     assert response_data.get_responses("Names")[0].display_name == "After"
 
 
+def test_change_metadata_reports_only_persisted_differences_and_noop_skips_write(tmp_path, monkeypatch):
+    original = attendee(extra_people=2, extras_names=["Alice", ""])
+    write_cache(tmp_path, monkeypatch, [original])
+    cache = response_data.RESPONSE_DATA_CACHE
+
+    with patch("offkai_bot.data.response.atomic_write_json", side_effect=AssertionError("no write expected")) as writer:
+        no_op = update_attendee_names(
+            "Names",
+            UID,
+            NOW,
+            "Before",
+            2,
+            ["Alice", ""],
+            display_name="  Before  ",
+            guest_names=[(0, "Alice")],
+        )
+    assert no_op.changes == ()
+    assert no_op.registration is original
+    assert response_data.RESPONSE_DATA_CACHE is cache
+    writer.assert_not_called()
+
+    changed = update_attendee_names(
+        "Names",
+        UID,
+        NOW,
+        "Before",
+        2,
+        ["Alice", ""],
+        display_name="  After  ",
+        guest_names=[(1, "  New Guest  ")],
+    )
+    assert changed.changes == (
+        AttendeeNameChange(None, "Before", "After"),
+        AttendeeNameChange(2, "", "New Guest"),
+    )
+    assert changed.registration.display_name == "After"
+    assert changed.registration.extras_names == ["Alice", "New Guest"]
+
+
 def test_failed_atomic_write_leaves_cache_and_disk_unchanged(tmp_path, monkeypatch):
     original = attendee()
     path = write_cache(tmp_path, monkeypatch, [original])
@@ -391,5 +433,7 @@ def test_millisecond_identity_match_accepts_submillisecond_storage(tmp_path, mon
     original = attendee(timestamp=NOW.replace(microsecond=123456))
     write_cache(tmp_path, monkeypatch, [original])
     expected = NOW
-    updated = update_attendee_names("Names", UID, expected, "Before", 2, ["Alice", "Bob"], display_name="After")
+    updated = update_attendee_names(
+        "Names", UID, expected, "Before", 2, ["Alice", "Bob"], display_name="After"
+    ).registration
     assert updated.display_name == "After"

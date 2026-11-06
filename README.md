@@ -204,9 +204,11 @@ event's Discord thread to enforce the configured guild boundary, then revalidate
 registration timestamp, original names and guest slots immediately before its existing atomic JSON write. A removed,
 rejoined or promoted/demoted registration, a changed guest count, changed surplus legacy names, or another admin's
 name edit is rejected with a refresh/retry conflict instead of overwriting current data. Unrelated payment or
-check-in updates are preserved. Saving names never sends Discord messages, changes roles, or triggers signup,
-payment, attendance or promotion actions; previously sent messages are not updated. A lost response is treated as
-unconfirmed and the admin panel refreshes rather than retrying the write blindly.
+check-in updates are preserved. After the atomic write, saving names sends one bilingual DM listing only the fields
+that actually changed. It does not change roles or trigger signup, payment, attendance or promotion actions, and
+previously sent event messages are not updated. If DM delivery fails, the saved names remain and the admin panel
+shows a warning. A lost response is treated as unconfirmed and the admin panel refreshes rather than retrying the
+write blindly.
 
 ### Payment proof by DM
 

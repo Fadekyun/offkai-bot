@@ -64,6 +64,23 @@ class WaitlistEntry:
     payment_selection_demotes: bool = False
 
 
+@dataclass(frozen=True)
+class AttendeeNameChange:
+    """One persisted name field change captured during the atomic commit."""
+
+    guest_number: int | None  # None for the primary attendee, 1-based for guests
+    old_name: str | None
+    new_name: str
+
+
+@dataclass(frozen=True)
+class AttendeeNameUpdate:
+    """The committed record plus immutable old/new values for notifications."""
+
+    registration: Response
+    changes: tuple[AttendeeNameChange, ...]
+
+
 def get_effective_display_name(entry: Response | WaitlistEntry) -> str:
     """Return the event snapshot name, falling back safely for legacy records."""
 
@@ -637,7 +654,7 @@ def update_attendee_names(
     *,
     display_name: str | None = None,
     guest_names: list[tuple[int, str]] | None = None,
-) -> Response:
+) -> AttendeeNameUpdate:
     """Replace only the edited names on the current confirmed attendee record.
 
     ``expected_*`` is the raw snapshot captured when the editor opened. It must
@@ -708,6 +725,19 @@ def update_attendee_names(
     if current_extras_snapshot != expected_extras_names:
         raise RegistrationChangedError()
 
+    # Capture persisted differences before staging; trim-equivalent edits are no-ops.
+    persisted_changes: list[AttendeeNameChange] = []
+    if normalized_display_name is not None and normalized_display_name != current.display_name:
+        persisted_changes.append(AttendeeNameChange(None, current.display_name, normalized_display_name))
+    for index, value in normalized_guests:
+        current_slot = current.extras_names[index] if index < len(current.extras_names) else None
+        if value != current_slot:
+            persisted_changes.append(AttendeeNameChange(index + 1, current_slot, value))
+
+    if not persisted_changes:
+        _log.info("No persisted name changes for user %s in event %s.", user_id, event_name)
+        return AttendeeNameUpdate(registration=current, changes=())
+
     # Detach the record and names list from the live cache before writing.
     staged_names = list(current.extras_names)
     for index, value in normalized_guests:
@@ -728,7 +758,7 @@ def update_attendee_names(
         all_data,
     )
     _log.info("Updated attendee names for user %s in event %s.", user_id, event_name)
-    return updated
+    return AttendeeNameUpdate(registration=updated, changes=tuple(persisted_changes))
 
 
 def remove_response(event_name: str, user_id: int) -> Response:

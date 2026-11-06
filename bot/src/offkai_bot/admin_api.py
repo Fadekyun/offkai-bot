@@ -33,6 +33,7 @@ from offkai_bot.event_actions import fetch_thread_for_event, update_event_messag
 from offkai_bot.interactions import (
     SignupContext,
     _add_user_to_event_thread,
+    build_attendee_names_changed_message,
     build_confirmation_message,
     credit_promoted_attendance,
     send_signup_reply,
@@ -42,6 +43,8 @@ from offkai_bot.registration_removal import remove_registration
 from offkai_bot.role_management import assign_event_role
 
 _log = logging.getLogger(__name__)
+
+NAME_CHANGE_NOTIFICATION_WARNING = "Names were saved, but the attendee notification DM could not be delivered."
 
 
 async def parse_admin_request(request: web.Request, client: discord.Client) -> tuple[str, str] | web.Response:
@@ -359,9 +362,10 @@ def create_admin_app(client: discord.Client) -> web.Application:
             return web.json_response({"error": "not_found", "saved": False}, status=404)
         if event.archived or event.interest_check or event.thread_id != thread.id:
             return web.json_response({"error": "event_unavailable", "saved": False}, status=400)
+        committed_event_name = event.event_name
         try:
-            updated = update_attendee_names(
-                event.event_name,
+            update = update_attendee_names(
+                committed_event_name,
                 int(user_id),
                 expected_timestamp,
                 expected_display_name,
@@ -377,9 +381,27 @@ def create_admin_app(client: discord.Client) -> web.Application:
         except Exception:
             _log.exception("Admin name update failed for event %r", event_name)
             return web.json_response({"error": "write_failed", "saved": False}, status=500)
+
+        # The names are durable now. Resolve/send only after the commit so a
+        # notification failure can never be reported as a failed save.
+        warnings: list[str] = []
+        updated = update.registration
+        if update.changes:
+            try:
+                user = client.get_user(updated.user_id) or await client.fetch_user(updated.user_id)
+                message = build_attendee_names_changed_message(event, update.changes, event_name=committed_event_name)
+                if message:
+                    await user.send(message, allowed_mentions=discord.AllowedMentions.none())
+            except discord.HTTPException:
+                _log.warning("Name-change DM failed for user %s in event %r", updated.user_id, event_name)
+                warnings.append(NAME_CHANGE_NOTIFICATION_WARNING)
+            except Exception:
+                _log.exception("Name-change notification failed for user %s in event %r", updated.user_id, event_name)
+                warnings.append(NAME_CHANGE_NOTIFICATION_WARNING)
         return web.json_response(
             {
                 "saved": True,
+                "warnings": warnings,
                 "registration": {
                     "user_id": str(updated.user_id),
                     "registration_timestamp": expected_timestamp.isoformat(),

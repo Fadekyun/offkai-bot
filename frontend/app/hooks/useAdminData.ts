@@ -213,6 +213,7 @@ export function useAdminData() {
     let result: {
       saved?: boolean
       error?: string
+      warnings?: string[]
       registration?: { user_id?: string; registration_timestamp?: string; display_name?: string | null
         extra_people?: number; extras_names?: string[] }
     } = {}
@@ -268,7 +269,14 @@ export function useAdminData() {
       setAttendees(applyNames)
       attendeesRef.current = applyNames(attendeesRef.current)
       await refresh()
-      return stillCurrent() ? 'saved' : 'stale'
+      // The editor token handles identity changes; do not leak this operation's
+      // warning/success into a replaced registration in the same event either.
+      if (!stillCurrent() || !attendeesRef.current.some(a => a.status === 'attending' &&
+          a.user_id === userId && a.registration_timestamp === timestamp)) return 'stale'
+      setActionWarnings(Array.isArray(result.warnings)
+        ? result.warnings.filter(warning => typeof warning === 'string')
+        : [])
+      return 'saved'
     }
     if (response?.status === 400) return 'invalid'
     if (response?.status === 401) return 'error'

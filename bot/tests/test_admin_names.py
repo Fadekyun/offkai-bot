@@ -91,6 +91,9 @@ def names_setup(monkeypatch, mock_paths):
     thread.id = event.thread_id
     thread.guild.id = 555
     client.get_channel.return_value = thread
+    user = MagicMock(spec=discord.User, send=AsyncMock())
+    client.get_user.return_value = user
+    client.fetch_user = AsyncMock(return_value=user)
     monkeypatch.setattr(admin_api, "get_config", lambda: {"ADMIN_KEY": "synthetic-admin", "GUILDS": [555]})
     monkeypatch.setattr(admin_api, "get_event", lambda name: event)
     return event, client, Path(mock_paths["responses"])
@@ -102,11 +105,23 @@ async def post_names(client, event, body, *, headers=HEADERS):
         return reply.status, await reply.json()
 
 
-async def test_name_edit_roundtrip_persists_only_names_and_has_no_discord_side_effects(names_setup):
+async def test_name_edit_persists_before_sending_one_changed_fields_dm(names_setup):
     event, client, path = names_setup
     current = make_attendee()
     add_response(event.event_name, current)
+    user = client.get_user.return_value
+    sent = []
 
+    async def send(message, **kwargs):
+        sent.append((message, kwargs))
+        # The disk and cache must already contain the committed names.
+        assert get_responses(event.event_name)[0].display_name == "After"
+        assert get_responses(event.event_name)[0].extras_names == ["Alicia", "Bob"]
+        disk = json.loads(path.read_text(encoding="utf-8"))
+        assert disk[event.event_name]["attendees"][0]["display_name"] == "After"
+        assert disk[event.event_name]["attendees"][0]["extras_names"] == ["Alicia", "Bob"]
+
+    user.send.side_effect = send
     body = payload(
         event,
         current,
@@ -120,6 +135,7 @@ async def test_name_edit_roundtrip_persists_only_names_and_has_no_discord_side_e
     assert status == 200
     assert result == {
         "saved": True,
+        "warnings": [],
         "registration": {
             "user_id": str(UID),
             "registration_timestamp": NOW.isoformat(),
@@ -128,17 +144,28 @@ async def test_name_edit_roundtrip_persists_only_names_and_has_no_discord_side_e
             "extras_names": ["Alicia", "Bob"],
         },
     }
+    assert len(sent) == 1
+    message, kwargs = sent[0]
+    assert message == (
+        "✏️ The organizer changed your registration for **Names endpoint**:\n"
+        "👤 Name: ~~Before~~ → **After**\n"
+        "👥 Guest 1: ~~Alice~~ → **Alicia**\n"
+        "\n"
+        "✏️ 主催者が**Names endpoint**の登録内容を変更しました：\n"
+        "👤 名前：~~Before~~ → **After**\n"
+        "👥 同伴者1：~~Alice~~ → **Alicia**"
+    )
+    allowed = kwargs["allowed_mentions"]
+    assert allowed.users is False and allowed.roles is False and allowed.everyone is False
+    client.get_user.assert_called_once_with(UID)
+    client.fetch_user.assert_not_called()
+    user.send.assert_awaited_once()
+    client.fetch_channel.assert_not_called()
+
     saved = get_responses(event.event_name)[0]
-    assert saved.display_name == "After"
-    assert saved.extras_names == ["Alicia", "Bob"]
     assert saved.payment_method == "Bank"
     assert saved.attendee_number == 4
     assert saved.extras_attendee_numbers == [5, 6]
-    disk = json.loads(path.read_text(encoding="utf-8"))
-    assert disk[event.event_name]["attendees"][0]["extras_names"] == ["Alicia", "Bob"]
-    client.fetch_user.assert_not_called()
-    client.get_user.assert_not_called()
-    client.fetch_channel.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -170,6 +197,9 @@ async def test_malformed_requests_are_rejected_without_mutation(names_setup, bod
     assert get_responses(event.event_name) is cache
     assert get_responses(event.event_name)[0] is current
     assert path.read_bytes() == disk
+    client.get_user.assert_not_called()
+    client.fetch_user.assert_not_called()
+    client.get_user.return_value.send.assert_not_awaited()
 
 
 async def test_authentication_and_event_guards(names_setup, monkeypatch):
@@ -226,6 +256,7 @@ async def test_preflight_fails_closed_for_cache_miss_wrong_guild_and_missing_thr
     status, result = await post_names(client, event, body)
     assert status == 200
     assert result["saved"] is True
+    assert result["warnings"] == []
     client.fetch_channel.assert_awaited_once_with(event.thread_id)
 
     body = payload(event, make_attendee(display_name="After"))
@@ -298,6 +329,9 @@ async def test_stale_or_replaced_registrations_conflict_without_overwrite(names_
     status, result = await post_names(client, event, body)
     assert status == 409
     assert result == {"error": "registration_changed", "saved": False}
+    client.get_user.assert_not_called()
+    client.fetch_user.assert_not_called()
+    client.get_user.return_value.send.assert_not_awaited()
     if stale_kind == "waitlist":
         assert get_responses(event.event_name) == []
         assert get_waitlist(event.event_name)[0].display_name == "Before"
@@ -320,6 +354,133 @@ async def test_second_admin_save_conflicts_and_first_remains(names_setup):
     assert get_responses(event.event_name)[0].display_name == "After"
 
 
+async def test_unchanged_supplied_field_is_omitted_from_dm(names_setup):
+    event, client, _ = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    user = client.get_user.return_value
+    sent = []
+
+    async def send(message, **kwargs):
+        sent.append(message)
+
+    user.send.side_effect = send
+    status, result = await post_names(
+        client,
+        event,
+        payload(
+            event,
+            current,
+            changes={
+                "display_name": "Before",
+                "extras_names": [{"index": 0, "value": "Alicia"}],
+            },
+        ),
+    )
+    assert status == 200
+    assert result["saved"] is True
+    assert len(sent) == 1
+    assert "👥 Guest 1: ~~Alice~~ → **Alicia**" in sent[0]
+    assert "👥 同伴者1：~~Alice~~ → **Alicia**" in sent[0]
+    assert "👤 Name:" not in sent[0]
+    assert "👤 名前：" not in sent[0]
+
+
+async def test_committed_event_name_is_used_if_the_event_mutates_during_dm_prefetch(names_setup):
+    event, client, _ = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    body = payload(event, current)
+    user = client.get_user.return_value
+    sent = []
+
+    async def send(message, **kwargs):
+        sent.append(message)
+
+    async def fetch_user(_user_id):
+        event.event_name = "Renamed after commit"
+        return user
+
+    user.send.side_effect = send
+    client.get_user.return_value = None
+    client.fetch_user = AsyncMock(side_effect=fetch_user)
+    status, result = await post_names(client, event, body)
+
+    assert status == 200
+    assert result["warnings"] == []
+    assert len(sent) == 1
+    assert "**Names endpoint**" in sent[0]
+    assert "Renamed after commit" not in sent[0]
+    assert get_responses("Names endpoint")[0].display_name == "After"
+
+
+@pytest.mark.parametrize("failure_stage", ["fetch", "send"])
+async def test_http_notification_failure_keeps_saved_names_and_returns_one_warning(names_setup, failure_stage):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    user = client.get_user.return_value
+    if failure_stage == "fetch":
+        client.get_user.return_value = None
+        client.fetch_user = AsyncMock(side_effect=discord.NotFound(MagicMock(status=404), "Missing user"))
+    else:
+        user.send.side_effect = discord.Forbidden(MagicMock(status=403), "DM closed")
+
+    status, result = await post_names(client, event, payload(event, current))
+
+    assert status == 200
+    assert result["saved"] is True
+    assert result["warnings"] == [admin_api.NAME_CHANGE_NOTIFICATION_WARNING]
+    assert result["registration"]["display_name"] == "After"
+    assert get_responses(event.event_name)[0].display_name == "After"
+    disk = json.loads(path.read_text(encoding="utf-8"))
+    assert disk[event.event_name]["attendees"][0]["display_name"] == "After"
+
+
+async def test_postcommit_formatting_failure_is_a_warning_not_a_failed_save(names_setup):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    with patch(
+        "offkai_bot.admin_api.build_attendee_names_changed_message",
+        side_effect=ValueError("synthetic formatting failure"),
+    ):
+        status, result = await post_names(client, event, payload(event, current))
+
+    assert status == 200
+    assert result["saved"] is True
+    assert result["warnings"] == [admin_api.NAME_CHANGE_NOTIFICATION_WARNING]
+    assert get_responses(event.event_name)[0].display_name == "After"
+    assert json.loads(path.read_text(encoding="utf-8"))[event.event_name]["attendees"][0]["display_name"] == "After"
+    client.get_user.return_value.send.assert_not_awaited()
+
+
+async def test_no_actual_persisted_change_skips_dm_and_reports_saved(names_setup):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    disk = path.read_bytes()
+    status, result = await post_names(
+        client,
+        event,
+        payload(
+            event,
+            current,
+            changes={
+                "display_name": "  Before  ",
+                "extras_names": [{"index": 0, "value": "Alice"}],
+            },
+        ),
+    )
+    assert status == 200
+    assert result["saved"] is True
+    assert result["warnings"] == []
+    assert path.read_bytes() == disk
+    client.get_user.assert_not_called()
+    client.fetch_user.assert_not_called()
+    client.get_user.return_value.send.assert_not_awaited()
+
+
 async def test_disk_write_failure_returns_error_and_preserves_cache_and_disk(names_setup):
     event, client, path = names_setup
     current = make_attendee()
@@ -334,3 +495,6 @@ async def test_disk_write_failure_returns_error_and_preserves_cache_and_disk(nam
     assert get_responses(event.event_name)[0] is current
     assert current.display_name == "Before"
     assert path.read_bytes() == disk
+    client.get_user.assert_not_called()
+    client.fetch_user.assert_not_called()
+    client.get_user.return_value.send.assert_not_awaited()

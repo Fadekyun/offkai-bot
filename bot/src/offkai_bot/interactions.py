@@ -2,7 +2,7 @@ import asyncio
 import hashlib
 import logging
 import random
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -15,6 +15,7 @@ from discord import ui
 from offkai_bot.data.event import Event
 from offkai_bot.data.ranking import can_rank_message_sent, decrease_rank, get_rank, mark_achieved_rank, update_rank
 from offkai_bot.data.response import (
+    AttendeeNameChange,
     Response,
     WaitlistEntry,
     add_response,
@@ -251,6 +252,84 @@ def get_remaining_capacity(event: Event) -> int | None:
 
     current_count = get_current_attendance_count(event.event_name)
     return max(0, event.max_capacity - current_count)
+
+
+# Name-change DMs are bounded so long legacy names or multibyte text can never
+# exceed Discord's 2000-character message limit. Try to show full values first,
+# then lower the per-value bound until the bilingual message fits comfortably.
+_NAME_CHANGE_LIMITS = (160, 120, 96, 80, 64, 48, 32, 24, 16, 8)
+_NAME_CHANGE_EVENT_LIMIT = 100
+_NAME_CHANGE_MESSAGE_LIMIT = 1900
+_MISSING_NAME_EN = "(no name)"
+_MISSING_NAME_JA = "（名前なし）"
+
+
+def _bounded_notification_value(value: str | None, limit: int) -> str | None:
+    if value is None:
+        return None
+    text = value.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
+    if not text:
+        return None
+    if len(text) > limit:
+        text = text[: max(1, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _escaped_notification_name(value: str | None, limit: int, *, japanese: bool) -> str:
+    text = _bounded_notification_value(value, limit)
+    if text is None:
+        text = _MISSING_NAME_JA if japanese else _MISSING_NAME_EN
+    return discord.utils.escape_markdown(text)
+
+
+def _discord_message_length(message: str) -> int:
+    # Discord bounds message content in UTF-16 code units, not code points.
+    return len(message.encode("utf-16-le")) // 2
+
+
+def _render_attendee_names_changed_message(
+    event_name: str,
+    changes: Sequence[AttendeeNameChange],
+    name_limit: int,
+) -> str:
+    bounded_event_name = _bounded_notification_value(event_name, _NAME_CHANGE_EVENT_LIMIT) or ""
+    escaped_event = discord.utils.escape_markdown(bounded_event_name)
+    english = [f"✏️ The organizer changed your registration for **{escaped_event}**:"]
+    japanese = [f"✏️ 主催者が**{escaped_event}**の登録内容を変更しました："]
+    for change in changes:
+        old_en = _escaped_notification_name(change.old_name, name_limit, japanese=False)
+        new_en = _escaped_notification_name(change.new_name, name_limit, japanese=False)
+        old_ja = _escaped_notification_name(change.old_name, name_limit, japanese=True)
+        new_ja = _escaped_notification_name(change.new_name, name_limit, japanese=True)
+        if change.guest_number is None:
+            english.append(f"👤 Name: ~~{old_en}~~ → **{new_en}**")
+            japanese.append(f"👤 名前：~~{old_ja}~~ → **{new_ja}**")
+        else:
+            english.append(f"👥 Guest {change.guest_number}: ~~{old_en}~~ → **{new_en}**")
+            japanese.append(f"👥 同伴者{change.guest_number}：~~{old_ja}~~ → **{new_ja}**")
+    return "\n".join(english) + "\n\n" + "\n".join(japanese)
+
+
+def build_attendee_names_changed_message(
+    event: Event,
+    changes: Sequence[AttendeeNameChange],
+    *,
+    event_name: str | None = None,
+) -> str:
+    """Bilingual DM body listing only the persisted name fields that changed.
+
+    ``event_name`` lets the caller use the name captured at commit time so a
+    later event mutation cannot change the wording of this committed operation.
+    """
+    changes = tuple(changes)
+    if not changes:
+        return ""
+    committed_event_name = event.event_name if event_name is None else event_name
+    for name_limit in _NAME_CHANGE_LIMITS:
+        message = _render_attendee_names_changed_message(committed_event_name, changes, name_limit)
+        if _discord_message_length(message) <= _NAME_CHANGE_MESSAGE_LIMIT:
+            return message
+    return _render_attendee_names_changed_message(committed_event_name, changes, _NAME_CHANGE_LIMITS[-1])
 
 
 def build_confirmation_message(event: Event, response: Response) -> str:
