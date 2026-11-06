@@ -120,6 +120,24 @@ test('name save shows persisted names even when refresh fails, and distinguishes
     assert.equal(posts, 1)
     assert.equal(gets, 0)
 
+    // An explicit too-large rejection is not an ambiguous/unconfirmed result and does not refresh.
+    posts = 0
+    gets = 0
+    globalThis.fetch = async (_url, options) => {
+      if (options?.method === 'POST') {
+        posts++
+        return Response.json({ error: 'request_too_large', saved: false }, { status: 413 })
+      }
+      gets++
+      return Response.json({ event_name: event, attendees: [attendee] })
+    }
+    begin(seed(), event, { 3: [attendee] })
+    const tooLarge = useAdminData()
+    assert.equal(await tooLarge.saveAttendeeNames(event, uid, timestamp, expected, changes), 'too_large')
+    assert.equal(posts, 1)
+    assert.equal(gets, 0)
+
+
     // A partial/malformed success reply is not applied and never becomes a success claim.
     posts = 0
     gets = 0

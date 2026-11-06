@@ -207,8 +207,9 @@ name edit is rejected with a refresh/retry conflict instead of overwriting curre
 check-in updates are preserved. After the atomic write, saving names sends one bilingual DM listing only the fields
 that actually changed. It does not change roles or trigger signup, payment, attendance or promotion actions, and
 previously sent event messages are not updated. If DM delivery fails, the saved names remain and the admin panel
-shows a warning. A lost response is treated as unconfirmed and the admin panel refreshes rather than retrying the
-write blindly.
+shows a warning. Name-edit requests are bounded to 16 KiB of JSON; oversized edits are rejected with a clear
+too-large message and are not saved. A lost response is treated as unconfirmed and the admin panel refreshes rather
+than retrying the write blindly.
 
 ### Payment proof by DM
 

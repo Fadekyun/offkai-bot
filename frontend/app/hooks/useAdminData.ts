@@ -5,7 +5,7 @@ import { matchesCheckin } from '../lib/checkin'
 
 const groupSize = (a: Attendee) => 1 + (a.extra_people ?? 0)
 
-export type NamesSaveOutcome = 'saved' | 'conflict' | 'invalid' | 'unconfirmed' | 'error' | 'stale'
+export type NamesSaveOutcome = 'saved' | 'conflict' | 'invalid' | 'too_large' | 'unconfirmed' | 'error' | 'stale'
 export type NamesExpected = { display_name: string | null; extra_people: number; extras_names: (string | null)[] }
 export type NamesChanges = { display_name?: string; extras_names?: { index: number; value: string }[] }
 
@@ -278,6 +278,7 @@ export function useAdminData() {
         : [])
       return 'saved'
     }
+    if (response?.status === 413) return 'too_large'
     if (response?.status === 400) return 'invalid'
     if (response?.status === 401) return 'error'
     if (response?.status === 500 && result.error === 'write_failed') return 'error'

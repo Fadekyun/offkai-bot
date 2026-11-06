@@ -45,6 +45,9 @@ from offkai_bot.role_management import assign_event_role
 _log = logging.getLogger(__name__)
 
 NAME_CHANGE_NOTIFICATION_WARNING = "Names were saved, but the attendee notification DM could not be delivered."
+# The names edit carries the complete raw conflict snapshot plus edited values.
+# Keep the other admin endpoints on the application's 4 KiB limit.
+NAME_EDIT_MAX_REQUEST_BYTES = 16 * 1024
 
 
 async def parse_admin_request(request: web.Request, client: discord.Client) -> tuple[str, str] | web.Response:
@@ -322,11 +325,15 @@ def create_admin_app(client: discord.Client) -> web.Application:
         return web.json_response({"promoted": True, "warnings": warnings})
 
     async def rename(request: web.Request) -> web.Response:
-        parsed = await parse_admin_request(request, client)
+        bounded_request = request.clone(client_max_size=NAME_EDIT_MAX_REQUEST_BYTES)
+        try:
+            parsed = await parse_admin_request(bounded_request, client)
+        except web.HTTPRequestEntityTooLarge:
+            return web.json_response({"error": "request_too_large", "saved": False}, status=413)
         if isinstance(parsed, web.Response):
             return parsed
         event_name, user_id = parsed
-        body = await request.json()
+        body = await bounded_request.json()
         try:
             (
                 expected_timestamp,

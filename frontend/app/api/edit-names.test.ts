@@ -50,7 +50,8 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
       editNames:'Edit names',attendeeName:'Attendee name',guestName:n=>'Guest '+n+' name',
       unnamedGuest:'Unnamed guest',saveNames:'Save names',cancel:'Cancel',namesSaved:'Names saved.',
       namesNoChanges:'No changes to save.',namesInvalid:'Invalid names',
-      namesConflict:'Registration changed',namesUnconfirmed:'Unconfirmed',namesSaveError:'Save error'}};}`)
+      namesConflict:'Registration changed',namesUnconfirmed:'Unconfirmed',namesSaveError:'Save error',
+      namesTooLarge:'Edit too large'}};}`)
     const code = ts.transpileModule(fs.readFileSync('app/components/admin/EditNames.tsx', 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
     }).outputText.replaceAll("from 'react'", "from './react.js'").replaceAll("from '../../lib/i18n'", "from './i18n.js'")
@@ -120,6 +121,24 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
       assert.equal(find(tree, element => element.props.role === 'dialog'), undefined)
       assert.equal(find(tree, element => element.props.role === 'alert')?.props.children, expected)
     }
+
+    // A known too-large rejection keeps the draft and shows the localized size message.
+    outcome = 'too_large'
+    const beforeTooLarge = calls.length
+    tree = openWith()
+    dialog = find(tree, element => element.props.role === 'dialog')
+    inputs = collect(dialog).filter(element => element.type === 'input')
+    ;(inputs[0].props.onChange as (event: unknown) => void)({ target: { value: 'Too large draft' } })
+    tree = render()
+    dialog = find(tree, element => element.props.role === 'dialog')
+    const tooLargeForm = find(dialog, element => element.type === 'form')
+    await (tooLargeForm!.props.onSubmit as (event: unknown) => Promise<void>)({ preventDefault() {} })
+    tree = render()
+    dialog = find(tree, element => element.props.role === 'dialog')
+    assert.ok(dialog)
+    assert.equal(find(dialog, element => element.props.role === 'alert')?.props.children, 'Edit too large')
+    assert.equal(calls.length, beforeTooLarge + 1)
+    assert.equal(find(tree, element => element.props.role === 'status'), undefined)
 
     // Blank edits and a no-op save never call the bot.
     outcome = 'saved'

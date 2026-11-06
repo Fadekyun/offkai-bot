@@ -8,6 +8,75 @@ export const dynamic = 'force-dynamic'
 const MAX_DISPLAY_NAME_LENGTH = 32
 const MAX_GUEST_NAME_LENGTH = 160
 const MAX_EXTRA_PEOPLE = 5
+// Mirrors the bot's names-only allowance. Other admin routes retain 4 KiB.
+const MAX_NAME_EDIT_REQUEST_BYTES = 16 * 1024
+
+type BoundedJson = { kind: 'ok'; value: unknown } | { kind: 'too_large' } | { kind: 'invalid' }
+
+function cancelBody(body: ReadableStream<Uint8Array> | null): void {
+  if (!body) return
+  try {
+    body.cancel().catch(() => {})
+  } catch {
+    // A body may already be locked/closed; rejection is already decided.
+  }
+}
+
+function cancelReader(reader: ReadableStreamDefaultReader<Uint8Array>): void {
+  try {
+    reader.cancel().catch(() => {})
+  } catch {
+    // Cancellation is best effort and must never delay the known rejection.
+  }
+}
+
+// Read the raw UTF-8 body while bounding actual bytes consumed. Content-Length
+// is only an early rejection hint; streamed/chunked bodies are counted too.
+async function readBoundedJson(request: NextRequest): Promise<BoundedJson> {
+  const declared = request.headers.get('content-length')
+  if (declared !== null && /^[0-9]+$/.test(declared) && Number(declared) > MAX_NAME_EDIT_REQUEST_BYTES) {
+    cancelBody(request.body)
+    return { kind: 'too_large' }
+  }
+  if (!request.body) return { kind: 'invalid' }
+  const reader = request.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      if (!value) continue
+      if (total + value.byteLength > MAX_NAME_EDIT_REQUEST_BYTES) {
+        cancelReader(reader)
+        return { kind: 'too_large' }
+      }
+      total += value.byteLength
+      chunks.push(value)
+    }
+  } catch {
+    cancelReader(reader)
+    return { kind: 'invalid' }
+  } finally {
+    try {
+      reader.releaseLock()
+    } catch {
+      // The reader may still be releasing a best-effort cancellation.
+    }
+  }
+  const bytes = new Uint8Array(total)
+  let offset = 0
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset)
+    offset += chunk.byteLength
+  }
+  try {
+    const text = new TextDecoder('utf-8', { fatal: true }).decode(bytes)
+    return { kind: 'ok', value: JSON.parse(text) }
+  } catch {
+    return { kind: 'invalid' }
+  }
+}
 
 type NamesBody = {
   event_name: string
@@ -84,17 +153,33 @@ export async function POST(request: NextRequest) {
   if (!key || request.nextUrl.searchParams.get('key') !== key) {
     return NextResponse.json({ error: 'unauthorized', saved: false }, { status: 401 })
   }
-  const body = parseNamesBody(await request.json().catch(() => null))
+  const bounded = await readBoundedJson(request)
+  if (bounded.kind === 'too_large') {
+    return NextResponse.json({ error: 'request_too_large', saved: false }, { status: 413 })
+  }
+  if (bounded.kind !== 'ok') {
+    return NextResponse.json({ error: 'invalid_request', saved: false }, { status: 400 })
+  }
+  const body = parseNamesBody(bounded.value)
   if (!body) return NextResponse.json({ error: 'invalid_request', saved: false }, { status: 400 })
   const botUrl = process.env.BOT_ADMIN_URL
   if (!botUrl) return NextResponse.json({ error: 'bot_unavailable', saved: false }, { status: 503 })
+  const forwardedBody = JSON.stringify(body)
+  if (new TextEncoder().encode(forwardedBody).byteLength > MAX_NAME_EDIT_REQUEST_BYTES) {
+    return NextResponse.json({ error: 'request_too_large', saved: false }, { status: 413 })
+  }
   try {
     const response = await fetch(`${botUrl}/registrations/names`, {
       method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
+      body: forwardedBody,
       signal: AbortSignal.timeout(30_000),
     })
-    return NextResponse.json(await response.json(), { status: response.status })
+    if (response.status === 413) {
+      // Known rejection: never wait for or read a possibly stalled/large error body.
+      cancelBody(response.body)
+      return NextResponse.json({ error: 'request_too_large', saved: false }, { status: 413 })
+    }
+    return NextResponse.json(JSON.parse(await response.text()), { status: response.status })
   } catch {
     // The bot may have committed before the response was lost. Do not claim no save happened,
     // and never retry blindly; the admin refreshes to confirm.

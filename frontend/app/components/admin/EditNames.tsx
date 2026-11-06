@@ -19,7 +19,7 @@ type Draft = {
   guestInputs: string[]
 }
 
-type ErrorKind = 'invalid' | 'conflict' | 'unconfirmed' | 'error' | 'unchanged'
+type ErrorKind = 'invalid' | 'conflict' | 'too_large' | 'unconfirmed' | 'error' | 'unchanged'
 
 function buildChanges(draft: Draft): { changes: NamesChanges | null; invalid: boolean } {
   const changes: NamesChanges = {}
@@ -148,15 +148,18 @@ export function EditNames({ attendee, eventName, onSave }: {
     // A stale event/identity response must not surface in the new view.
     if (outcome === 'stale') return
     if (outcome === 'conflict' || outcome === 'unconfirmed') { setDraft(null); setError(outcome); return }
-    setError(outcome === 'invalid' ? 'invalid' : 'error')
+    if (outcome === 'invalid') { setError('invalid'); return }
+    if (outcome === 'too_large') { setError('too_large'); return }
+    setError('error')
   }
 
   if (attendee.status !== 'attending') return null
   const errorMessage = error === 'invalid' ? t.namesInvalid
     : error === 'conflict' ? t.namesConflict
-      : error === 'unconfirmed' ? t.namesUnconfirmed
-        : error === 'unchanged' ? t.namesNoChanges
-          : t.namesSaveError
+      : error === 'too_large' ? t.namesTooLarge
+        : error === 'unconfirmed' ? t.namesUnconfirmed
+          : error === 'unchanged' ? t.namesNoChanges
+            : t.namesSaveError
 
   return (
     <div className="relative text-xs">

@@ -10,6 +10,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from offkai_bot import admin_api
+from offkai_bot.data import response as response_data
 from offkai_bot.data.event import Event
 from offkai_bot.data.response import (
     Response,
@@ -166,6 +167,129 @@ async def test_name_edit_persists_before_sending_one_changed_fields_dm(names_set
     assert saved.payment_method == "Bank"
     assert saved.attendee_number == 4
     assert saved.extras_attendee_numbers == [5, 6]
+
+
+async def post_names_raw(client, raw: bytes):
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post("/registrations/names", data=raw, headers=HEADERS)
+        return reply.status, await reply.json()
+
+
+@pytest.mark.parametrize("guest_count", range(6))
+async def test_max_length_multibyte_names_are_accepted_for_every_guest_count(names_setup, guest_count):
+    event, client, path = names_setup
+    old_display = "名😀" * 16
+    new_display = "新😀" * 16
+    old_guests = ["客😀" * 80 for _ in range(guest_count)]
+    new_guests = ["伴😀" * 80 for _ in range(guest_count)]
+    current = make_attendee(
+        display_name=old_display,
+        extra_people=guest_count,
+        extras_names=old_guests,
+        extras_attendee_numbers=list(range(5, 5 + guest_count)),
+    )
+    add_response(event.event_name, current)
+    changes = {"display_name": new_display}
+    if guest_count:
+        changes["extras_names"] = [{"index": index, "value": value} for index, value in enumerate(new_guests)]
+    body = payload(event, current, changes=changes)
+    raw = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    status, result = await post_names_raw(client, raw)
+
+    assert status == 200, (len(raw), result)
+    assert result["saved"] is True
+    assert result["warnings"] == []
+    saved = get_responses(event.event_name)[0]
+    assert saved.display_name == new_display
+    assert saved.extras_names == new_guests
+    assert json.loads(path.read_text(encoding="utf-8"))[event.event_name]["attendees"][0]["display_name"] == new_display
+    assert client.get_user.return_value.send.await_count == 1
+
+
+async def test_exact_16k_padded_json_is_accepted_and_one_byte_over_is_rejected(names_setup):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    base = json.dumps(
+        payload(event, current, changes={"display_name": "After"}),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    exact = base + b" " * (admin_api.NAME_EDIT_MAX_REQUEST_BYTES - len(base))
+    too_large = exact + b" "
+    assert len(exact) == 16384
+    assert len(too_large) == 16385
+
+    status, result = await post_names_raw(client, exact)
+    assert status == 200, result
+    assert result["saved"] is True
+    assert get_responses(event.event_name)[0].display_name == "After"
+    assert client.get_user.return_value.send.await_count == 1
+
+    # Fresh registration for the rejection case.
+    response_data.RESPONSE_DATA_CACHE = None
+    path.write_text("{}")
+    load_responses()
+    current = make_attendee()
+    add_response(event.event_name, current)
+    disk = path.read_bytes()
+    base = json.dumps(
+        payload(event, current, changes={"display_name": "After"}),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    too_large = base + b" " * (admin_api.NAME_EDIT_MAX_REQUEST_BYTES + 1 - len(base))
+    status, result = await post_names_raw(client, too_large)
+    assert status == 413
+    assert result == {"error": "request_too_large", "saved": False}
+    assert get_responses(event.event_name)[0].display_name == "Before"
+    assert path.read_bytes() == disk
+    assert client.get_user.return_value.send.await_count == 1  # only the accepted first request
+    assert client.get_user.call_count == 1
+
+
+async def test_streamed_body_over_16k_is_rejected_without_usable_content_length(names_setup):
+    event, client, path = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    disk = path.read_bytes()
+    base = json.dumps(
+        payload(event, current, changes={"display_name": "After"}),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    raw = base + b" " * (admin_api.NAME_EDIT_MAX_REQUEST_BYTES + 1 - len(base))
+
+    async def chunks():
+        for offset in range(0, len(raw), 1000):
+            yield raw[offset : offset + 1000]
+
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post("/registrations/names", data=chunks(), headers=HEADERS)
+        result = await reply.json()
+    assert reply.status == 413
+    assert result == {"error": "request_too_large", "saved": False}
+    assert get_responses(event.event_name)[0].display_name == "Before"
+    assert path.read_bytes() == disk
+    client.get_user.assert_not_called()
+    client.get_user.return_value.send.assert_not_awaited()
+
+
+async def test_other_admin_routes_retain_the_4k_limit(names_setup):
+    event, client, _ = names_setup
+    current = make_attendee()
+    add_response(event.event_name, current)
+    base = json.dumps(
+        {"event_name": event.event_name, "user_id": str(UID), "registration_timestamp": NOW.isoformat()},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    raw = base + b" " * (4097 - len(base))
+    async with TestClient(TestServer(admin_api.create_admin_app(client))) as http:
+        reply = await http.post("/registrations/remove", data=raw, headers=HEADERS)
+        await reply.read()
+    assert reply.status == 413
+    client.get_user.assert_not_called()
 
 
 @pytest.mark.parametrize(

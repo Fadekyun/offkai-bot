@@ -107,6 +107,153 @@ test('names route requires organizer auth and validates malformed payloads befor
   }
 })
 
+
+test('names route bounds incoming raw UTF-8 bytes and classifies backend plain 413 explicitly', async () => {
+  const route = await loadRoute()
+  const previousFetch = globalThis.fetch
+  const previousKey = process.env.ADMIN_KEY
+  const previousBotUrl = process.env.BOT_ADMIN_URL
+  try {
+    process.env.ADMIN_KEY = 'synthetic-admin'
+    process.env.BOT_ADMIN_URL = 'http://synthetic-bot.invalid'
+    const url = 'http://localhost/api/registration/names?key=synthetic-admin'
+    const posts: { init: RequestInit }[] = []
+    globalThis.fetch = async (_url, init) => {
+      posts.push({ init: init! })
+      return Response.json({ saved: true, registration: { ...identity, ...changes } })
+    }
+    const raw = JSON.stringify(body)
+    const exact = raw + ' '.repeat(16384 - Buffer.byteLength(raw, 'utf8'))
+    const exactResponse = await route.POST(new NextRequest(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: exact,
+    }))
+    assert.equal(exactResponse.status, 200)
+    assert.equal(posts.length, 1)
+    const forwarded = String(posts[0].init.body)
+    assert.ok(Buffer.byteLength(forwarded, 'utf8') <= 16384)
+    assert.deepEqual(JSON.parse(forwarded), {
+      ...identity,
+      registration_timestamp: '2026-10-01T00:00:00.123Z',
+      expected,
+      changes,
+    })
+
+    const over = exact + ' '
+    const overResponse = await route.POST(new NextRequest(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: over,
+    }))
+    assert.equal(overResponse.status, 413)
+    assert.deepEqual(await overResponse.json(), { error: 'request_too_large', saved: false })
+    assert.equal(posts.length, 1)
+
+    // A non-closing stream that crosses the limit must be cancelled without waiting
+    // for EOF and without any upstream request.
+    let cancelled = false
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('x'.repeat(17000)))
+      },
+      cancel() { cancelled = true },
+    })
+    const streamResponse = await Promise.race([
+      route.POST(new NextRequest(url, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: stream, duplex: 'half',
+      } as unknown as ConstructorParameters<typeof NextRequest>[1])),
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('streamed overflow read did not terminate')), 2000)),
+    ])
+    assert.equal(streamResponse.status, 413)
+    assert.deepEqual(await streamResponse.json(), { error: 'request_too_large', saved: false })
+    assert.equal(cancelled, true)
+    assert.equal(posts.length, 1)
+
+    globalThis.fetch = async (_url, init) => {
+      posts.push({ init: init! })
+      return new Response('Maximum request body size 16384 exceeded.', {
+        status: 413, headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+      })
+    }
+    const plain413 = await route.POST(new NextRequest(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: raw,
+    }))
+    assert.equal(plain413.status, 413)
+    assert.deepEqual(await plain413.json(), { error: 'request_too_large', saved: false })
+    assert.equal(posts.length, 2)
+  } finally {
+    globalThis.fetch = previousFetch
+    if (previousKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = previousKey
+    if (previousBotUrl === undefined) delete process.env.BOT_ADMIN_URL; else process.env.BOT_ADMIN_URL = previousBotUrl
+    route.cleanup()
+  }
+})
+
+
+
+const promptly = async <T>(promise: Promise<T>): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('known 413 waited on a stalled stream')), 150)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+test('names route rejects stalled overflow and stalled backend 413 without awaiting cancellation', async () => {
+  const route = await loadRoute()
+  const previousFetch = globalThis.fetch
+  const previousKey = process.env.ADMIN_KEY
+  const previousBotUrl = process.env.BOT_ADMIN_URL
+  try {
+    process.env.ADMIN_KEY = 'synthetic-admin'
+    process.env.BOT_ADMIN_URL = 'http://synthetic-bot.invalid'
+    const url = 'http://localhost/api/registration/names?key=synthetic-admin'
+
+    let upstreamCalls = 0
+    globalThis.fetch = async () => { upstreamCalls++; throw new Error('Overflow must not be forwarded') }
+    for (const declared of [true, false]) {
+      let cancels = 0
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) { controller.enqueue(new Uint8Array(16385)) },
+        cancel() { cancels++; return new Promise(() => {}) },
+      })
+      const request = new NextRequest(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(declared ? { 'Content-Length': '16385' } : {}) },
+        body: stream,
+        duplex: 'half',
+      } as unknown as ConstructorParameters<typeof NextRequest>[1])
+      const response = await promptly<Response>(route.POST(request))
+      assert.equal(response.status, 413)
+      assert.deepEqual(await response.json(), { error: 'request_too_large', saved: false })
+      assert.equal(cancels, 1)
+      assert.equal(upstreamCalls, 0)
+    }
+
+    let responseCancels = 0
+    globalThis.fetch = async () => new Response(new ReadableStream({
+      cancel() { responseCancels++; return new Promise(() => {}) },
+    }), { status: 413 })
+    const stalled413 = await promptly<Response>(route.POST(new NextRequest(url, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    })))
+    assert.equal(stalled413.status, 413)
+    assert.deepEqual(await stalled413.json(), { error: 'request_too_large', saved: false })
+    assert.equal(responseCancels, 1)
+    assert.equal(upstreamCalls, 0)
+  } finally {
+    globalThis.fetch = previousFetch
+    if (previousKey === undefined) delete process.env.ADMIN_KEY; else process.env.ADMIN_KEY = previousKey
+    if (previousBotUrl === undefined) delete process.env.BOT_ADMIN_URL; else process.env.BOT_ADMIN_URL = previousBotUrl
+    route.cleanup()
+  }
+})
+
+
 test('names route forwards conflicts unchanged and never retries an uncertain commit', async () => {
   const route = await loadRoute()
   const previousFetch = globalThis.fetch
