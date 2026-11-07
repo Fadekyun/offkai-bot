@@ -1,5 +1,5 @@
 'use client'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { useT } from '../../lib/i18n'
 import type { Attendee } from '../../lib/types'
 import type { NamesChanges, NamesSaveOutcome } from '../../hooks/useAdminData'
@@ -19,7 +19,7 @@ type Draft = {
   guestInputs: string[]
 }
 
-type ErrorKind = 'invalid' | 'conflict' | 'too_large' | 'unconfirmed' | 'busy' | 'expired' | 'error' | 'unchanged'
+type ErrorKind = 'invalid' | 'conflict' | 'unconfirmed' | 'error' | 'unchanged'
 
 function buildChanges(draft: Draft): { changes: NamesChanges | null; invalid: boolean } {
   const changes: NamesChanges = {}
@@ -54,40 +54,23 @@ export function EditNames({ attendee, eventName, onSave }: {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<ErrorKind | null>(null)
   const [saved, setSaved] = useState(false)
-  const inFlight = useRef(false)
-  const requestToken = useRef(0)
-  const currentIdentity = useRef(identity)
-  const previousIdentity = useRef(identity)
+  // The parent remounts this editor when the attendee identity changes; matching
+  // the snapshot here also closes a stale draft in the same render.
   const activeDraft = draft?.identity === identity ? draft : null
   const name = attendee.display_name || attendee.username
-
-  // A rejoin, event switch or demotion invalidates the editor and its snapshot.
-  useEffect(() => {
-    currentIdentity.current = identity
-    if (previousIdentity.current === identity) return
-    previousIdentity.current = identity
-    requestToken.current += 1
-    inFlight.current = false
-    setDraft(null)
-    setBusy(false)
-    setError(null)
-    setSaved(false)
-  }, [identity])
 
   useEffect(() => {
     if (!activeDraft) return
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && !inFlight.current) setDraft(null)
+      if (event.key === 'Escape' && !busy) setDraft(null)
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [activeDraft])
+  }, [activeDraft, busy])
 
   function open() {
     if (attendee.status !== 'attending' || !attendee.registration_timestamp ||
         typeof attendee.names_revision !== 'string') return
-    requestToken.current += 1
-    inFlight.current = false
     setBusy(false)
     const originalExtrasNames = Array.from(
       { length: Math.max(attendee.extra_people, attendee.extras_names.length) },
@@ -112,20 +95,17 @@ export function EditNames({ attendee, eventName, onSave }: {
   }
 
   function cancel() {
-    if (inFlight.current) return
+    if (busy) return
     setDraft(null)
     setError(null)
   }
 
   async function submit(submitEvent: React.FormEvent) {
     submitEvent.preventDefault()
-    if (!activeDraft || inFlight.current) return
+    if (!activeDraft || busy) return
     const result = buildChanges(activeDraft)
     if (result.invalid) { setError('invalid'); return }
     if (!result.changes) { setError('unchanged'); return }
-    const requestIdentity = activeDraft.identity
-    const token = ++requestToken.current
-    inFlight.current = true
     setBusy(true)
     setError(null)
     let outcome: NamesSaveOutcome
@@ -140,33 +120,24 @@ export function EditNames({ attendee, eventName, onSave }: {
     } catch {
       outcome = 'unconfirmed'
     } finally {
-      if (requestToken.current === token && currentIdentity.current === requestIdentity) {
-        inFlight.current = false
-        setBusy(false)
-      }
+      setBusy(false)
     }
-    // A rejoin/demotion, event switch or newer editing request owns the state now.
-    if (requestToken.current !== token || currentIdentity.current !== requestIdentity) return
     if (outcome === 'saved') { setDraft(null); setSaved(true); return }
     // A stale event/identity response must not surface in the new view.
     if (outcome === 'stale') return
     if (outcome === 'conflict' || outcome === 'unconfirmed') { setDraft(null); setError(outcome); return }
-    if (outcome === 'invalid') { setError('invalid'); return }
-    if (outcome === 'too_large') { setError('too_large'); return }
-    if (outcome === 'busy') { setError('busy'); return }
-    if (outcome === 'expired') { setError('expired'); return }
-    setError('error')
+    setError(outcome === 'invalid' ? 'invalid' : 'error')
   }
 
   if (attendee.status !== 'attending') return null
-  const errorMessage = error === 'invalid' ? t.namesInvalid
-    : error === 'conflict' ? t.namesConflict
-      : error === 'too_large' ? t.namesTooLarge
-        : error === 'unconfirmed' ? t.namesUnconfirmed
-          : error === 'busy' ? t.namesBusy
-            : error === 'expired' ? t.namesExpired
-              : error === 'unchanged' ? t.namesNoChanges
-                : t.namesSaveError
+  const errorMessages: Record<ErrorKind, string> = {
+    invalid: t.namesInvalid,
+    conflict: t.namesConflict,
+    unconfirmed: t.namesUnconfirmed,
+    unchanged: t.namesNoChanges,
+    error: t.namesSaveError,
+  }
+  const errorMessage = error ? errorMessages[error] : ''
 
   return (
     <div className="relative text-xs">

@@ -50,8 +50,7 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
       editNames:'Edit names',attendeeName:'Attendee name',guestName:n=>'Guest '+n+' name',
       unnamedGuest:'Unnamed guest',saveNames:'Save names',cancel:'Cancel',namesSaved:'Names saved.',
       namesNoChanges:'No changes to save.',namesInvalid:'Invalid names',
-      namesConflict:'Registration changed',namesUnconfirmed:'Unconfirmed',namesBusy:'Too busy',namesExpired:'Session expired',namesSaveError:'Save error',
-      namesTooLarge:'Edit too large'}};}`)
+      namesConflict:'Registration changed',namesUnconfirmed:'Unconfirmed',namesSaveError:'Save error'}};}`)
     const code = ts.transpileModule(fs.readFileSync('app/components/admin/EditNames.tsx', 'utf8'), {
       compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2022, jsx: ts.JsxEmit.ReactJSX },
     }).outputText.replaceAll("from 'react'", "from './react.js'").replaceAll("from '../../lib/i18n'", "from './i18n.js'")
@@ -121,43 +120,6 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
       assert.equal(find(tree, element => element.props.role === 'dialog'), undefined)
       assert.equal(find(tree, element => element.props.role === 'alert')?.props.children, expected)
     }
-
-    // Busy and expired sessions keep the draft with clear localized errors.
-    for (const [failure, expected] of [['busy', 'Too busy'], ['expired', 'Session expired']] as const) {
-      const beforeBusy = calls.length
-      outcome = failure
-      tree = openWith()
-      dialog = find(tree, element => element.props.role === 'dialog')
-      inputs = collect(dialog).filter(element => element.type === 'input')
-      ;(inputs[0].props.onChange as (event: unknown) => void)({ target: { value: 'Busy draft' } })
-      tree = render()
-      dialog = find(tree, element => element.props.role === 'dialog')
-      const failureForm = find(dialog, element => element.type === 'form')
-      await (failureForm!.props.onSubmit as (event: unknown) => Promise<void>)({ preventDefault() {} })
-      tree = render()
-      dialog = find(tree, element => element.props.role === 'dialog')
-      assert.ok(dialog)
-      assert.equal(find(dialog, element => element.props.role === 'alert')?.props.children, expected)
-      assert.equal(calls.length, beforeBusy + 1)
-    }
-
-    // A known too-large rejection keeps the draft and shows the localized size message.
-    outcome = 'too_large'
-    const beforeTooLarge = calls.length
-    tree = openWith()
-    dialog = find(tree, element => element.props.role === 'dialog')
-    inputs = collect(dialog).filter(element => element.type === 'input')
-    ;(inputs[0].props.onChange as (event: unknown) => void)({ target: { value: 'Too large draft' } })
-    tree = render()
-    dialog = find(tree, element => element.props.role === 'dialog')
-    const tooLargeForm = find(dialog, element => element.type === 'form')
-    await (tooLargeForm!.props.onSubmit as (event: unknown) => Promise<void>)({ preventDefault() {} })
-    tree = render()
-    dialog = find(tree, element => element.props.role === 'dialog')
-    assert.ok(dialog)
-    assert.equal(find(dialog, element => element.props.role === 'alert')?.props.children, 'Edit too large')
-    assert.equal(calls.length, beforeTooLarge + 1)
-    assert.equal(find(tree, element => element.props.role === 'status'), undefined)
 
     // Blank edits and a no-op save never call the bot.
     outcome = 'saved'
@@ -231,6 +193,7 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
     assert.equal(calls.length, beforeCancel)
 
     // A completion for an old registration cannot leak into a replacement's editor.
+    // The parent remounts EditNames via its identity key, simulated by reset().
     let resolvePending!: (value: string) => void
     saveHandler = (() => new Promise<string>(resolve => { resolvePending = resolve })) as typeof saveHandler
     tree = openWith()
@@ -242,8 +205,10 @@ test('edit-names dialog keeps a local draft, snapshots the original registration
     const pendingForm = find(dialog, element => element.type === 'form')
     const pendingSubmit = (pendingForm!.props.onSubmit as (event: unknown) => Promise<void>)({ preventDefault() {} })
     tree = render({ registration_timestamp: '2026-10-02T00:00:00.000Z', display_name: 'Rejoined' })
+    assert.equal(find(tree, element => element.props.role === 'dialog'), undefined)
     resolvePending('saved')
     await pendingSubmit
+    reset()
     tree = render({ registration_timestamp: '2026-10-02T00:00:00.000Z', display_name: 'Rejoined' })
     assert.equal(find(tree, element => element.props.role === 'dialog'), undefined)
     assert.equal(find(tree, element => element.props.role === 'status'), undefined)

@@ -4,10 +4,7 @@ import hmac
 import logging
 import os
 import re
-import secrets
-import time
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import discord
@@ -48,48 +45,6 @@ from offkai_bot.role_management import assign_event_role
 _log = logging.getLogger(__name__)
 
 NAME_CHANGE_NOTIFICATION_WARNING = "Names were saved, but the attendee notification DM could not be delivered."
-# One logical name save is sent as at most six small field parts plus one commit
-# request. Every request stays within the application's 4 KiB body limit.
-MAX_ACTIVE_NAME_BATCHES = 8
-NAME_BATCH_TTL_SECONDS = 120.0
-_NAME_FIELD_GUEST_RE = re.compile(r"guest:([0-4])")
-
-
-@dataclass
-class PendingNameBatch:
-    batch_id: str
-    event_name: str
-    user_id: int
-    expected_timestamp: datetime
-    expected_revision: str
-    manifest: tuple[str, ...]
-    values: dict[str, str]
-    expires_at: float
-
-
-def _name_batch_now() -> float:
-    return time.monotonic()
-
-
-def _prune_name_batches(batches: dict[str, PendingNameBatch]) -> None:
-    now = _name_batch_now()
-    for batch_id in [batch_id for batch_id, batch in batches.items() if batch.expires_at <= now]:
-        del batches[batch_id]
-
-
-def _parse_name_manifest(value: object) -> tuple[str, ...]:
-    if not isinstance(value, list) or not 1 <= len(value) <= 6:
-        raise ValueError("Invalid name manifest")
-    manifest: list[str] = []
-    for value_item in value:
-        if not isinstance(value_item, str):
-            raise ValueError("Invalid name field")
-        if value_item != "display_name" and not _NAME_FIELD_GUEST_RE.fullmatch(value_item):
-            raise ValueError("Invalid name field")
-        if value_item in manifest:
-            raise ValueError("Duplicate name field")
-        manifest.append(value_item)
-    return tuple(manifest)
 
 
 def _parse_name_value(field: str, value: object) -> str:
@@ -107,8 +62,18 @@ def _parse_names_revision(value: object) -> str:
     return value
 
 
-def _batch_context(batch: PendingNameBatch) -> tuple[str, int, datetime, str, tuple[str, ...]]:
-    return batch.event_name, batch.user_id, batch.expected_timestamp, batch.expected_revision, batch.manifest
+def _parse_guest_names(value: object) -> list[tuple[int, str]]:
+    if value is None:
+        return []
+    if not isinstance(value, dict):
+        raise ValueError("Invalid guest names")
+    guests: list[tuple[int, str]] = []
+    for key, guest_value in value.items():
+        if not isinstance(key, str) or not re.fullmatch(r"[0-4]", key):
+            raise ValueError("Invalid guest names")
+        index = int(key)
+        guests.append((index, _parse_name_value(f"guest:{index}", guest_value)))
+    return sorted(guests)
 
 
 async def parse_admin_request(request: web.Request, client: discord.Client) -> tuple[str, str] | web.Response:
@@ -148,79 +113,22 @@ def _require_name_fields(body: dict, required: set[str], optional: set[str] | No
         raise ValueError("Unexpected request fields")
 
 
-def _parse_name_context(body: dict) -> tuple[datetime, str, tuple[str, ...]]:
-    return (
-        _parse_registration_timestamp(body.get("registration_timestamp")),
-        _parse_names_revision(body.get("expected_revision")),
-        _parse_name_manifest(body.get("manifest")),
-    )
-
-
-def _parse_name_batch_id(value: object) -> str:
-    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{20,100}", value):
-        raise ValueError("Invalid batch id")
-    return value
-
-
-def _parse_name_stage_payload(
+def _parse_name_update_payload(
     body: dict,
-) -> tuple[datetime, str, tuple[str, ...], str, str, str | None]:
+) -> tuple[datetime, str, str | None, list[tuple[int, str]]]:
     _require_name_fields(
         body,
-        {
-            "operation",
-            "event_name",
-            "user_id",
-            "registration_timestamp",
-            "expected_revision",
-            "manifest",
-            "field",
-            "value",
-        },
-        {"batch_id"},
+        {"event_name", "user_id", "registration_timestamp", "expected_revision"},
+        {"display_name", "guest_names"},
     )
-    if body.get("operation") != "stage":
-        raise ValueError("Invalid operation")
-    expected_timestamp, expected_revision, manifest = _parse_name_context(body)
-    field = body.get("field")
-    if not isinstance(field, str) or field not in manifest:
-        raise ValueError("Invalid staged field")
-    value = _parse_name_value(field, body.get("value"))
-    batch_id = body.get("batch_id")
-    return (
-        expected_timestamp,
-        expected_revision,
-        manifest,
-        field,
-        value,
-        None if batch_id is None else _parse_name_batch_id(batch_id),
-    )
-
-
-def _parse_name_commit_payload(body: dict) -> tuple[datetime, str, tuple[str, ...], str]:
-    _require_name_fields(
-        body,
-        {
-            "operation",
-            "event_name",
-            "user_id",
-            "registration_timestamp",
-            "expected_revision",
-            "manifest",
-            "batch_id",
-        },
-    )
-    if body.get("operation") != "commit":
-        raise ValueError("Invalid operation")
-    expected_timestamp, expected_revision, manifest = _parse_name_context(body)
-    return expected_timestamp, expected_revision, manifest, _parse_name_batch_id(body.get("batch_id"))
+    expected_timestamp = _parse_registration_timestamp(body.get("registration_timestamp"))
+    expected_revision = _parse_names_revision(body.get("expected_revision"))
+    display_name = _parse_name_value("display_name", body["display_name"]) if "display_name" in body else None
+    guest_names = _parse_guest_names(body.get("guest_names"))
+    return expected_timestamp, expected_revision, display_name, guest_names
 
 
 def create_admin_app(client: discord.Client) -> web.Application:
-    # Pending name-edit parts are per app instance: a restart discards them and
-    # nothing is written to disk or the response cache until the final commit.
-    name_batches: dict[str, PendingNameBatch] = {}
-
     async def confirm_payment(request: web.Request) -> web.Response:
         parsed = await parse_admin_request(request, client)
         if isinstance(parsed, web.Response):
@@ -412,86 +320,10 @@ def create_admin_app(client: discord.Client) -> web.Application:
         except web.HTTPRequestEntityTooLarge:
             return web.json_response({"error": "request_too_large", "saved": False}, status=413)
         event_name, user_id = parsed
-        operation = body.get("operation")
-
-        if operation == "stage":
-            try:
-                expected_timestamp, expected_revision, manifest, field, value, batch_id = _parse_name_stage_payload(
-                    body
-                )
-            except (ValueError, TypeError):
-                return web.json_response({"error": "invalid_request", "saved": False}, status=400)
-            if batch_id is None:
-                _prune_name_batches(name_batches)
-                if len(name_batches) >= MAX_ACTIVE_NAME_BATCHES:
-                    return web.json_response({"error": "batch_busy", "saved": False}, status=409)
-                batch_id = secrets.token_urlsafe(24)
-                pending = PendingNameBatch(
-                    batch_id=batch_id,
-                    event_name=event_name,
-                    user_id=int(user_id),
-                    expected_timestamp=expected_timestamp,
-                    expected_revision=expected_revision,
-                    manifest=manifest,
-                    values={field: value},
-                    expires_at=_name_batch_now() + NAME_BATCH_TTL_SECONDS,
-                )
-                name_batches[batch_id] = pending
-            else:
-                pending = name_batches.get(batch_id)
-                if pending is None:
-                    return web.json_response({"error": "batch_unknown", "saved": False}, status=409)
-                if pending.expires_at <= _name_batch_now():
-                    del name_batches[batch_id]
-                    return web.json_response({"error": "batch_expired", "saved": False}, status=409)
-                if _batch_context(pending) != (
-                    event_name,
-                    int(user_id),
-                    expected_timestamp,
-                    expected_revision,
-                    manifest,
-                ):
-                    return web.json_response({"error": "batch_context_mismatch", "saved": False}, status=409)
-                existing = pending.values.get(field)
-                if existing is not None and existing != value:
-                    return web.json_response({"error": "batch_conflict", "saved": False}, status=409)
-                pending.values.setdefault(field, value)
-            return web.json_response(
-                {
-                    "batch_id": batch_id,
-                    "staged": field,
-                    "complete": all(field_name in pending.values for field_name in manifest),
-                }
-            )
-
-        if operation != "commit":
-            return web.json_response({"error": "invalid_request", "saved": False}, status=400)
         try:
-            expected_timestamp, expected_revision, manifest, batch_id = _parse_name_commit_payload(body)
+            expected_timestamp, expected_revision, display_name, guest_names = _parse_name_update_payload(body)
         except (ValueError, TypeError):
             return web.json_response({"error": "invalid_request", "saved": False}, status=400)
-        pending = name_batches.get(batch_id)
-        if pending is None:
-            # The batch was already consumed (possibly committed) or discarded by
-            # a restart. Do not claim the save failed: the caller must refresh and
-            # confirm, and must not retry the commit automatically.
-            return web.json_response({"error": "batch_unknown", "unconfirmed": True}, status=409)
-        if pending.expires_at <= _name_batch_now():
-            del name_batches[batch_id]
-            return web.json_response({"error": "batch_expired", "saved": False}, status=409)
-        if _batch_context(pending) != (
-            event_name,
-            int(user_id),
-            expected_timestamp,
-            expected_revision,
-            manifest,
-        ):
-            return web.json_response({"error": "batch_context_mismatch", "saved": False}, status=409)
-        if not all(field_name in pending.values for field_name in manifest):
-            return web.json_response({"error": "batch_incomplete", "saved": False}, status=409)
-        # Consume before the first await so an overlapping commit cannot apply or
-        # notify twice. A preflight failure discards this batch without writing.
-        del name_batches[batch_id]
 
         settings = get_config()
         try:
@@ -517,14 +349,9 @@ def create_admin_app(client: discord.Client) -> web.Application:
             return web.json_response({"error": "not_found", "saved": False}, status=404)
         if event.archived or event.interest_check or event.thread_id != thread.id:
             return web.json_response({"error": "event_unavailable", "saved": False}, status=400)
-        committed_event_name = event.event_name
-        display_name = pending.values.get("display_name")
-        guest_names = [
-            (index, pending.values[f"guest:{index}"]) for index in range(5) if f"guest:{index}" in pending.values
-        ]
         try:
             update = update_attendee_names(
-                committed_event_name,
+                event.event_name,
                 int(user_id),
                 expected_timestamp,
                 expected_revision,
@@ -546,7 +373,7 @@ def create_admin_app(client: discord.Client) -> web.Application:
         if update.changes:
             try:
                 user = client.get_user(updated.user_id) or await client.fetch_user(updated.user_id)
-                message = build_attendee_names_changed_message(event, update.changes, event_name=committed_event_name)
+                message = build_attendee_names_changed_message(event, update.changes)
                 if message:
                     await user.send(message, allowed_mentions=discord.AllowedMentions.none())
             except discord.HTTPException:

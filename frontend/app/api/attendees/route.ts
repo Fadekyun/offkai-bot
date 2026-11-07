@@ -105,7 +105,6 @@ export async function GET(request: NextRequest) {
     drinks: a.drinks || [],
     extra_people: a.extra_people || 0,
     extras_names: a.extras_names || [],
-    names_revision: namesRevision(a.display_name ?? null, a.extra_people || 0, a.extras_names || []),
     attendee_number: null,
     extras_attendee_numbers: [] as number[],
     status: 'waitlist' as const

@@ -310,26 +310,16 @@ def _render_attendee_names_changed_message(
     return "\n".join(english) + "\n\n" + "\n".join(japanese)
 
 
-def build_attendee_names_changed_message(
-    event: Event,
-    changes: Sequence[AttendeeNameChange],
-    *,
-    event_name: str | None = None,
-) -> str:
-    """Bilingual DM body listing only the persisted name fields that changed.
-
-    ``event_name`` lets the caller use the name captured at commit time so a
-    later event mutation cannot change the wording of this committed operation.
-    """
+def build_attendee_names_changed_message(event: Event, changes: Sequence[AttendeeNameChange]) -> str:
+    """Bilingual DM body listing only the persisted name fields that changed."""
     changes = tuple(changes)
     if not changes:
         return ""
-    committed_event_name = event.event_name if event_name is None else event_name
     for name_limit in _NAME_CHANGE_LIMITS:
-        message = _render_attendee_names_changed_message(committed_event_name, changes, name_limit)
+        message = _render_attendee_names_changed_message(event.event_name, changes, name_limit)
         if _discord_message_length(message) <= _NAME_CHANGE_MESSAGE_LIMIT:
             return message
-    return _render_attendee_names_changed_message(committed_event_name, changes, _NAME_CHANGE_LIMITS[-1])
+    return _render_attendee_names_changed_message(event.event_name, changes, _NAME_CHANGE_LIMITS[-1])
 
 
 def build_confirmation_message(event: Event, response: Response) -> str:

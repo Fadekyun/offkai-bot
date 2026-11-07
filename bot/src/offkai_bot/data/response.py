@@ -129,6 +129,13 @@ def compute_names_revision(
 def _normalized_edited_name(value: object, max_length: int, field: str) -> str:
     if not isinstance(value, str):
         raise ValueError(f"{field} must be a string")
+    # Reject control characters and invalid Unicode surrogates before trimming so
+    # they cannot be persisted or expanded into multi-byte JSON escapes.
+    if any(
+        ord(character) < 0x20 or 0x7F <= ord(character) <= 0x9F or 0xD800 <= ord(character) <= 0xDFFF
+        for character in value
+    ):
+        raise ValueError(f"{field} contains unsupported characters")
     name = value.strip()
     if not name:
         raise ValueError(f"{field} cannot be blank")

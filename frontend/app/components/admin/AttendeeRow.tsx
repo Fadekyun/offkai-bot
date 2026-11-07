@@ -88,7 +88,8 @@ export function AttendeeRow({
               <path d="M18 6 6 18M6 6l12 12" />
             </svg>
           </button>
-          <EditNames attendee={a} eventName={eventName} onSave={onSaveNames} />
+          <EditNames key={`${eventName}:${a.user_id}:${a.registration_timestamp ?? ""}:${a.status}`}
+            attendee={a} eventName={eventName} onSave={onSaveNames} />
           <RemoveRegistration attendee={a} onRemove={onRemove} />
         </div>
       </div>
